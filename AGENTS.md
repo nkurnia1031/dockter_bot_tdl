@@ -90,9 +90,11 @@ nama key dan status configured/missing.
   menjalankan UI Telegram tanpa mount `/data`; `APP_ROLE=worker` menjalankan
   sesi `.tdl`, export, download, serta utility tanpa `BOT_TOKEN`.
 - `docker-compose.gateway.yml` menjalankan backend, backend-queue, Redis
-  internal, Telegram frontend, dan worker lokal di VPS utama;
-  `docker-compose.worker.yml` menjalankan worker VPS kedua. Backend menyimpan
-  identity/state dan worker mengaksesnya lewat `/internal/v1`.
+  internal, dan frontend Telegram sesuai profile Compose; paket worker lokalnya
+  opsional. `docker-compose.worker.yml` menjalankan worker mandiri beserta
+  layanan transfer/helper. Gateway Lite production ada di `remote-2`; worker
+  bernama `local` berjalan sebagai project Compose mandiri di host lama.
+  Backend menyimpan identity/state dan worker mengaksesnya lewat `/internal/v1`.
 - Route worker dipilih per profile dan disimpan di `worker_routes.json`. Job
   menyimpan worker asalnya saat dibuat, sehingga perubahan route hanya berlaku
   untuk job baru dan tidak memindahkan job aktif. `state.json` gateway adalah
@@ -350,59 +352,52 @@ gateway/worker, dan mem-publish release static Web. Deploy dilakukan dari root
 production yang benar agar Compose project dan volume yang sudah ada tetap
 digunakan.
 
-Gateway lokal berada di `/www/wwwroot/dockter_bot_tdl`. Dari direktori itu:
+Gateway Lite production berada di `remote-2` (`aapanel2.naufix.space`), dengan
+root `/www/wwwroot/dockter_bot_tdl` dan Compose project `tme3bot-gateway`.
+Deploy gateway dan Web dari root itu setelah label Compose diverifikasi:
+
+```bash
+ssh -i ~/.ssh/id_ed25519_dockter_gateway -o IdentitiesOnly=yes root@aapanel2.naufix.space 'cd /www/wwwroot/dockter_bot_tdl && git pull --ff-only origin main && COMPOSE_PROJECT_NAME=tme3bot-gateway GATEWAY_MODE=lite GATEWAY_LITE_LOCAL_STACK=off python3 run.py deploy gateway --pull'
+ssh -i ~/.ssh/id_ed25519_dockter_gateway -o IdentitiesOnly=yes root@aapanel2.naufix.space 'cd /www/wwwroot/dockter_bot_tdl && python3 run.py deploy web'
+```
+
+Worker `local` berjalan sebagai project mandiri `tme3bot-worker-local` pada
+host lama, dari checkout `/www/wwwroot/dockter_bot_tdl`, Compose file
+`docker-compose.worker.yml`, service `worker`. Interpolasi Compose memakai
+`/root/.config/tme3bot/worker-local-migration/.env.compose`; env worker berada
+di file `.env.worker` pada direktori yang sama. File runtime itu root-only.
+Pastikan tidak ada job lokal aktif, lalu pull dan recreate hanya service
+`worker` dengan IMAGE_TAG commit yang dituju:
 
 ```bash
 git pull --ff-only origin main
-python3 run.py deploy gateway --pull
+IMAGE_TAG="$(git rev-parse --short=12 HEAD)" docker compose --env-file /root/.config/tme3bot/worker-local-migration/.env.compose -p tme3bot-worker-local -f docker-compose.worker.yml pull worker
+IMAGE_TAG="$(git rev-parse --short=12 HEAD)" docker compose --env-file /root/.config/tme3bot/worker-local-migration/.env.compose -p tme3bot-worker-local -f docker-compose.worker.yml up -d --no-deps --force-recreate worker
 ```
 
-Gateway compose hanya menjalankan `backend`, `telegram`, dan `worker-local`.
-Worker `remote-1` berada di VPS `138.2.34.55` dan dideploy melalui SSH dari
-root `/www/wwwroot/downloads/bot` pada host tersebut. `HostKeyAlias` memakai
-hostname worker yang sudah dipercaya untuk memvalidasi host key saat koneksi
-menggunakan IP. Worker `remote-2` berada di `aapanel2.naufix.space`; root
-repo dan Compose project yang benar adalah `/www/wwwroot/dockter_bot_tdl` dan
-`dockter_bot_tdl`:
-
-Untuk setiap perubahan image atau kode worker, cakupan default adalah ketiga
-target worker: `worker-local` melalui deploy gateway, `remote-1`, dan
-`remote-2`. Deploy belum selesai sampai image versi yang sama sudah berjalan
-pada ketiganya. Jalankan kedua perintah SSH di bawah; keberhasilan deploy
-gateway atau `remote-1` saja tidak mencakup `remote-2`. Abaikan target hanya
-jika pengguna secara eksplisit membatasi deployment ke subset tertentu, lalu
-sebutkan target yang tidak dideploy pada laporan akhir.
+Worker `remote-1` berada di VPS `138.2.34.55`, root
+`/www/wwwroot/downloads/bot`, project `bot`; gunakan `HostKeyAlias` tepercaya
+saat SSH lewat IP:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && git pull --ff-only origin main && python3 run.py deploy worker --pull'
-ssh -i ~/.ssh/id_ed25519_dockter_gateway -o IdentitiesOnly=yes root@aapanel2.naufix.space 'cd /www/wwwroot/dockter_bot_tdl && git pull --ff-only origin main && python3 run.py deploy worker --pull'
 ```
 
-Web static sekarang berada dan dideploy pada gateway yang sama dengan backend,
-bukan pada VPS `remote-1`. Setelah GitHub Actions mem-publish release
-`web-latest`, jalankan deploy Web secara lokal dari root gateway
-`/www/wwwroot/dockter_bot_tdl`:
+Stack worker di `remote-2` saat ini berhenti karena host tersebut menjalankan
+gateway Lite. Untuk perubahan worker, deploy target aktif `local` dan
+`remote-1`; deploy worker `remote-2` hanya jika stack-nya diaktifkan kembali.
+Gateway dan Web dideploy terpisah di `remote-2`. Sebelum setiap deploy,
+verifikasi label `project.working_dir`, `project`, dan service; gunakan root,
+env file, host key, dan project yang sudah ada. Jangan membuat clone atau
+Compose project kedua.
 
-```bash
-python3 run.py deploy web
-```
-
-Sebelum deploy gateway, verifikasi label Compose `project.working_dir` dan
-`project` pada container gateway; sebelum deploy worker, verifikasi label yang
-sama pada container worker di masing-masing host `remote-1` dan `remote-2`.
-Verifikasi dan deploy kedua host secara terpisah, termasuk saat nama direktori
-checkout mereka sama dengan direktori gateway. Untuk
-`remote-2`, pastikan `project.working_dir=/www/wwwroot/dockter_bot_tdl` dan
-`project=dockter_bot_tdl`; jangan memakai path gateway/worker lain yang
-kebetulan juga memiliki checkout. Selalu jalankan setiap deploy dari root yang
-ditetapkan agar Compose memakai stack dan volume data yang benar; jangan
-membuat clone/deployment project kedua. Untuk SSH ke kedua worker, gunakan host
-key tepercaya dan agent/key yang tersedia. Deploy rutin tidak memerlukan
-enrollment atau pembuatan key baru. Jangan tampilkan private key atau
-passphrase.
+Setelah deploy image worker, pasang supervisor restart pada host worker aktif
+yang didukung setelah gateway siap. Verifikasi status systemd dan heartbeat;
+deploy image saja tidak memasang supervisor. Remote-2 tidak mendapat supervisor
+sampai worker di host itu dinyalakan.
 
 Perintah static deploy mengambil release `web-latest`, memverifikasi checksum,
-dan mengekstrak bundle ke `/www/wwwroot/ui.utama.naufix.space` pada gateway.
+dan mengekstrak bundle ke `/www/wwwroot/ui.utama.naufix.space` pada `remote-2`.
 Ia tidak menjalankan pnpm, Docker web, atau mengubah/reload Nginx. Untuk
 repository private, `WEB_RELEASE_TOKEN` adalah PAT GitHub dengan akses
 `Contents: Read` dan disimpan hanya di `.env` gateway; bukan di `.env.backend`

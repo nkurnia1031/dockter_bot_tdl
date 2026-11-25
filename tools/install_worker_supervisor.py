@@ -52,9 +52,17 @@ def _read_worker_token(path: Path) -> str:
     raise ValueError("WORKER_API_TOKEN is missing from the selected worker env file.")
 
 
-def _docker_target(root: Path, compose_file: Path, service: str) -> tuple[str, str]:
+def _docker_target(
+    root: Path,
+    compose_file: Path,
+    service: str,
+    compose_env_file: str = "",
+) -> tuple[str, str]:
+    compose = ["docker", "compose"]
+    if compose_env_file:
+        compose.extend(["--env-file", compose_env_file])
     listed = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "ps", "-aq", service],
+        [*compose, "-f", str(compose_file), "ps", "-aq", service],
         cwd=str(root),
         check=False,
         capture_output=True,
@@ -122,15 +130,23 @@ def install(worker: str, gateway_url: str, worker_env: Path | None = None) -> No
     if not root.is_dir() or not compose_file.is_file():
         raise RuntimeError("The fixed Compose checkout or file is missing on this host.")
     if worker_env is None:
-        default_env = ".env.worker.local" if name == "local" else ".env.worker"
-        worker_env = root / default_env
+        default_env = target.get("worker_env_file") or str(root / ".env.worker")
+        worker_env = Path(default_env)
     worker_env = worker_env.resolve()
-    if not worker_env.is_file() or worker_env.parent.resolve() != root.resolve():
-        raise RuntimeError("Worker env file must exist in the fixed Compose root.")
+    expected_worker_env = Path(
+        target.get("worker_env_file") or str(root / ".env.worker")
+    ).resolve()
+    if worker_env != expected_worker_env or not worker_env.is_file():
+        raise RuntimeError("Worker env file must match the fixed host mapping.")
     worker_token = _read_worker_token(worker_env)
     token = derive_supervisor_token(name, worker_token)
     del worker_token
-    project, _container_id = _docker_target(root, compose_file, target["service"])
+    project, _container_id = _docker_target(
+        root,
+        compose_file,
+        target["service"],
+        str(target.get("compose_env_file") or ""),
+    )
 
     origin = str(gateway_url or "").strip().rstrip("/")
     if not origin.startswith("https://") and not (

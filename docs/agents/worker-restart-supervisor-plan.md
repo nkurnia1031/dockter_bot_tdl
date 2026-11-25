@@ -1,8 +1,8 @@
 # Restart worker dari Web
 
-**Status:** implementasi ada di `main`; supervisor host belum dipasang pada host
-production. Tombol Web tidak dapat me-restart Docker sampai service systemd
-supervisor terpasang dan heartbeat muncul.
+**Status:** implementasi ada di `main`. Status instalasi tiap host harus
+diverifikasi dari unit systemd dan heartbeat supervisor; jangan menyimpulkan
+fitur aktif hanya dari deploy image.
 
 ## Tujuan
 
@@ -40,17 +40,29 @@ untuk target allowlist tetap, tanpa shell atau command yang dikirim pengguna.
 Supervisor membuat koneksi HTTPS keluar ke gateway setiap sekitar 3 detik dan
 menyimpan hasil lokal untuk deduplikasi.
 
-| Worker | Root Compose | Compose file | Service |
-| --- | --- | --- | --- |
-| `local` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.gateway.yml` | `worker-local` |
-| `remote-1` | `/www/wwwroot/downloads/bot` | `docker-compose.worker.yml` | `worker` |
-| `remote-2` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` |
+| Worker | Root Compose | Compose file | Service | Compose env |
+| --- | --- | --- | --- | --- |
+| `local` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` | `/root/.config/tme3bot/worker-local-migration/.env.compose` |
+| `remote-1` | `/www/wwwroot/downloads/bot` | `docker-compose.worker.yml` | `worker` | `.env` dari root Compose |
+| `remote-2` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` | `.env` dari root Compose |
+
+Gateway Lite saat ini berjalan di `remote-2`; stack worker di host itu sedang
+berhenti. Jangan pasang supervisor `remote-2` sampai service worker pada target
+tersebut sengaja diaktifkan. Worker bernama `local` adalah stack mandiri di
+host lama, bukan service pada Compose gateway.
+
+Untuk `local`, installer membaca `WORKER_API_TOKEN` dari
+`/root/.config/tme3bot/worker-local-migration/.env.worker`; kedua file runtime
+tersebut dibatasi permission root. Installer dan supervisor memakai
+`--env-file` yang sama agar Compose menemukan project dan konfigurasi worker
+yang sedang berjalan.
 
 Installer memeriksa label Compose container yang sedang ada dan menolak project,
 root, atau service yang tidak cocok. Ia membaca `WORKER_API_TOKEN` dari env file
-host tetapi menurunkan token supervisor khusus per worker dengan HMAC; token API
-worker tidak disalin ke konfigurasi supervisor. Perubahan/rotasi token worker
-mengharuskan supervisor pada host tersebut dipasang ulang.
+host tetap untuk target itu, lalu menurunkan token supervisor khusus per worker
+dengan HMAC; token API worker tidak disalin ke konfigurasi supervisor.
+Perubahan/rotasi token worker mengharuskan supervisor pada host tersebut
+dipasang ulang.
 
 Jalankan installer hanya dari checkout yang benar, pada host target, setelah
 Compose service worker sudah berjalan dan labelnya diverifikasi. Contoh:

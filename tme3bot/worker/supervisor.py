@@ -19,8 +19,10 @@ LOGGER = logging.getLogger("tme3bot.worker.supervisor")
 FIXED_TARGETS = {
     "local": {
         "compose_root": "/www/wwwroot/dockter_bot_tdl",
-        "compose_file": "docker-compose.gateway.yml",
-        "service": "worker-local",
+        "compose_file": "docker-compose.worker.yml",
+        "service": "worker",
+        "compose_env_file": "/root/.config/tme3bot/worker-local-migration/.env.compose",
+        "worker_env_file": "/root/.config/tme3bot/worker-local-migration/.env.worker",
     },
     "remote-1": {
         "compose_root": "/www/wwwroot/downloads/bot",
@@ -360,6 +362,22 @@ class DockerComposeWorkerAdapter:
         self.target = validate_supervisor_config(target)
         self.timeout_seconds = max(10, int(timeout_seconds))
         self.compose_path = Path(self.target["compose_root"]) / self.target["compose_file"]
+        self.compose_env_file = str(self.target.get("compose_env_file") or "")
+
+    def _compose_command(self, *args: str) -> list[str]:
+        command = ["docker", "compose"]
+        if self.compose_env_file:
+            command.extend(["--env-file", self.compose_env_file])
+        command.extend(
+            [
+                "-p",
+                self.target["project"],
+                "-f",
+                str(self.compose_path),
+                *args,
+            ]
+        )
+        return command
 
     def _run(self, args: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -374,10 +392,9 @@ class DockerComposeWorkerAdapter:
     def validate_target(self) -> None:
         if not self.compose_path.is_file():
             raise RuntimeError("Expected Compose file is missing.")
-        listed = self._run([
-            "docker", "compose", "-p", self.target["project"], "-f",
-            str(self.compose_path), "ps", "-aq", self.target["service"],
-        ])
+        listed = self._run(
+            self._compose_command("ps", "-aq", self.target["service"])
+        )
         if listed.returncode != 0:
             raise RuntimeError("Compose could not inspect the fixed service.")
         container_id = next((line.strip() for line in listed.stdout.splitlines() if line.strip()), "")
@@ -402,24 +419,21 @@ class DockerComposeWorkerAdapter:
             raise RuntimeError("Docker labels do not match the installed fixed target.")
 
     def stop(self) -> bool:
-        result = self._run([
-            "docker", "compose", "-p", self.target["project"], "-f",
-            str(self.compose_path), "stop", "--timeout", "15", self.target["service"],
-        ])
+        result = self._run(
+            self._compose_command(
+                "stop", "--timeout", "15", self.target["service"]
+            )
+        )
         return result.returncode == 0
 
     def start(self) -> bool:
-        result = self._run([
-            "docker", "compose", "-p", self.target["project"], "-f",
-            str(self.compose_path), "start", self.target["service"],
-        ])
+        result = self._run(self._compose_command("start", self.target["service"]))
         return result.returncode == 0
 
     def is_running(self) -> bool:
-        listed = self._run([
-            "docker", "compose", "-p", self.target["project"], "-f",
-            str(self.compose_path), "ps", "-q", self.target["service"],
-        ])
+        listed = self._run(
+            self._compose_command("ps", "-q", self.target["service"])
+        )
         container_id = next((line.strip() for line in listed.stdout.splitlines() if line.strip()), "")
         if listed.returncode != 0 or not container_id:
             return False

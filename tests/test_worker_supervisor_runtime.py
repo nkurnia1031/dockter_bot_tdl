@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
-from tme3bot.worker.supervisor import WorkerSupervisor
+from tools.install_worker_supervisor import _docker_target
+from tme3bot.worker.supervisor import (
+    FIXED_TARGETS,
+    DockerComposeWorkerAdapter,
+    WorkerSupervisor,
+)
 
 
 class FakeApi:
@@ -76,6 +84,55 @@ class WorkerSupervisorRuntimeTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_local_target_matches_standalone_worker_stack_and_uses_its_env(self):
+        expected = {
+            "compose_root": "/www/wwwroot/dockter_bot_tdl",
+            "compose_file": "docker-compose.worker.yml",
+            "service": "worker",
+            "compose_env_file": "/root/.config/tme3bot/worker-local-migration/.env.compose",
+            "worker_env_file": "/root/.config/tme3bot/worker-local-migration/.env.worker",
+        }
+        self.assertEqual(FIXED_TARGETS["local"], expected)
+
+        target = {
+            "worker": "local",
+            **expected,
+            "project": "tme3bot-worker-local",
+        }
+        labels = {
+            "com.docker.compose.project": "tme3bot-worker-local",
+            "com.docker.compose.project.working_dir": "/www/wwwroot/dockter_bot_tdl",
+            "com.docker.compose.service": "worker",
+        }
+        responses = [
+            subprocess.CompletedProcess([], 0, "worker-container\n", ""),
+            subprocess.CompletedProcess(
+                [], 0, json.dumps([{"Config": {"Labels": labels}}]), ""
+            ),
+        ]
+        with patch(
+            "tme3bot.worker.supervisor.subprocess.run", side_effect=responses
+        ) as run:
+            DockerComposeWorkerAdapter(target).validate_target()
+
+        command = run.call_args_list[0].args[0]
+        self.assertIn("--env-file", command)
+        self.assertIn(expected["compose_env_file"], command)
+
+        with patch(
+            "tools.install_worker_supervisor.subprocess.run", side_effect=responses
+        ) as run:
+            project, container_id = _docker_target(
+                Path(expected["compose_root"]),
+                Path(expected["compose_root"]) / expected["compose_file"],
+                expected["service"],
+                expected["compose_env_file"],
+            )
+
+        self.assertEqual(project, "tme3bot-worker-local")
+        self.assertEqual(container_id, "worker-container")
+        self.assertIn("--env-file", run.call_args_list[0].args[0])
 
     def test_restart_stops_and_starts_only_after_validating_fixed_target(self):
         self.supervisor.run_once()
