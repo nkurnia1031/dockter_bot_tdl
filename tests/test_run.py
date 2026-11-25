@@ -428,6 +428,7 @@ class RunScriptTests(unittest.TestCase):
             )
             with (
                 patch.object(run, "_compose_available", return_value=True),
+                patch.object(run, "active_gateway_mode", return_value="full"),
                 patch.object(run.subprocess, "run", return_value=ps_result) as subprocess_run,
                 patch("builtins.print"),
             ):
@@ -513,6 +514,7 @@ class RunScriptTests(unittest.TestCase):
             )
             with (
                 patch.object(run, "_compose_available", return_value=True),
+                patch.object(run, "active_gateway_mode", return_value="full"),
                 patch.object(run.subprocess, "run", return_value=ps_result) as subprocess_run,
                 patch("builtins.print"),
             ):
@@ -611,7 +613,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(recovery.kwargs["env"]["GATEWAY_MODE"], "full")
         self.assertEqual(recovery.kwargs["env"]["COMPOSE_PROFILES"], "full")
 
-    def test_failed_lite_restart_restores_lite_without_starting_full_services(self) -> None:
+    def test_lite_redeploy_skips_cutover_guard_and_restores_lite_on_failure(self) -> None:
         env = {
             "COMPOSE_FILE": "docker-compose.gateway.yml",
             "COMPOSE_CMD": "docker compose",
@@ -623,25 +625,34 @@ class RunScriptTests(unittest.TestCase):
             patch.object(
                 run,
                 "guard_lite_gateway_cutover",
-                side_effect=[None, RuntimeError("late preflight failure")],
-            ),
+                side_effect=AssertionError("same-mode redeploy is not a Lite cutover"),
+            ) as guard,
             patch.object(run, "active_gateway_mode", return_value="lite"),
-            patch.object(run.subprocess, "run", return_value=None) as subprocess_run,
+            patch.object(
+                run.subprocess,
+                "run",
+                side_effect=[None, RuntimeError("compose up failed"), None, None],
+            ) as subprocess_run,
             patch("builtins.print"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "late preflight failure"):
+            with self.assertRaisesRegex(RuntimeError, "compose up failed"):
                 run.run_compose(["up", "-d"], env)
 
-        self.assertEqual(subprocess_run.call_count, 3)
-        self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
+        guard.assert_not_called()
+        self.assertEqual(subprocess_run.call_count, 4)
         self.assertEqual(
-            subprocess_run.call_args_list[1].args[0][-7:],
+            subprocess_run.call_args_list[0].args[0][-7:],
             ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
         )
-        restore = subprocess_run.call_args_list[2]
-        self.assertEqual(restore.args[0][-2:], ["up", "-d"])
-        self.assertEqual(restore.kwargs["env"]["GATEWAY_MODE"], "lite")
-        self.assertEqual(restore.kwargs["env"]["COMPOSE_PROFILES"], "lite")
+        self.assertEqual(subprocess_run.call_args_list[1].args[0][-2:], ["up", "-d"])
+        restore_stop, restore_up = subprocess_run.call_args_list[2:]
+        self.assertEqual(
+            restore_stop.args[0][-7:],
+            ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
+        )
+        self.assertEqual(restore_up.args[0][-2:], ["up", "-d"])
+        self.assertEqual(restore_up.kwargs["env"]["GATEWAY_MODE"], "lite")
+        self.assertEqual(restore_up.kwargs["env"]["COMPOSE_PROFILES"], "lite")
 
     def test_failed_admission_stop_restores_previous_gateway_mode(self) -> None:
         env = {

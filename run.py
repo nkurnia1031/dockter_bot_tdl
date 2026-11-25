@@ -1317,9 +1317,34 @@ def restore_gateway_after_aborted_lite_cutover(
 
 def run_compose(args: list[str], dotenv: dict[str, str]) -> None:
     if args and args[0] == "up":
-        guard_lite_gateway_cutover(dotenv)
-        if gateway_mode_for_compose(dotenv) == "lite":
-            previous_mode = active_gateway_mode(dotenv) or "lite"
+        gateway_mode = gateway_mode_for_compose(dotenv)
+        if gateway_mode == "lite":
+            previous_mode = active_gateway_mode(dotenv)
+            if previous_mode == "lite":
+                # A routine redeploy of an already-Lite gateway does not stop
+                # or replace the local worker package. Historical local jobs
+                # that still need reconciliation must not block this update.
+                try:
+                    stop_inactive_gateway_services(dotenv)
+                    command = compose_base_command(dotenv) + args
+                    print("$ " + shlex.join(command))
+                    subprocess.run(
+                        command, cwd=PROJECT_DIR, env=compose_env(dotenv), check=True
+                    )
+                except Exception:
+                    try:
+                        restore_gateway_after_aborted_lite_cutover(dotenv, previous_mode)
+                    except Exception as restore_error:
+                        raise RuntimeError(
+                            "Lite redeploy failed and the previous Lite gateway could "
+                            "not be restored. Inspect Docker Compose before accepting "
+                            "new jobs."
+                        ) from restore_error
+                    raise
+                return
+
+            guard_lite_gateway_cutover(dotenv)
+            previous_mode = previous_mode or "lite"
             # Freeze public job admission before the authoritative second
             # check; the first check alone races with requests already in flight.
             try:
