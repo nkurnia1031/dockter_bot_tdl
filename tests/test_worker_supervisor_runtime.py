@@ -111,7 +111,7 @@ class WorkerSupervisorRuntimeTests(unittest.TestCase):
                 [], 0, json.dumps([{"Config": {"Labels": labels}}]), ""
             ),
         ]
-        with patch(
+        with patch.object(Path, "is_file", return_value=True), patch(
             "tme3bot.worker.supervisor.subprocess.run", side_effect=responses
         ) as run:
             DockerComposeWorkerAdapter(target).validate_target()
