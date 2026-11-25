@@ -27,6 +27,7 @@ FIXED_TARGETS = {
     "remote-1": {
         "compose_root": "/www/wwwroot/downloads/bot",
         "compose_file": "docker-compose.worker.yml",
+        "compose_env_file": ".env.worker",
         "service": "worker",
     },
     "remote-2": {

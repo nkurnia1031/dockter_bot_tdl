@@ -43,7 +43,7 @@ menyimpan hasil lokal untuk deduplikasi.
 | Worker | Root Compose | Compose file | Service | Compose env |
 | --- | --- | --- | --- | --- |
 | `local` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` | `/root/.config/tme3bot/worker-local-migration/.env.compose` |
-| `remote-1` | `/www/wwwroot/downloads/bot` | `docker-compose.worker.yml` | `worker` | `.env` dari root Compose |
+| `remote-1` | `/www/wwwroot/downloads/bot` | `docker-compose.worker.yml` | `worker` | `.env.worker` untuk interpolasi `PROFILE_ROOT` |
 | `remote-2` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` | `.env` dari root Compose |
 
 Gateway Lite saat ini berjalan di `remote-2`; stack worker di host itu sedang
@@ -52,8 +52,10 @@ tersebut sengaja diaktifkan. Worker bernama `local` adalah stack mandiri di
 host lama, bukan service pada Compose gateway.
 
 Untuk `local`, installer membaca `WORKER_API_TOKEN` dari
-`/root/.config/tme3bot/worker-local-migration/.env.worker`; kedua file runtime
-tersebut dibatasi permission root. Installer dan supervisor memakai
+`/root/.config/tme3bot/worker-local-migration/.env.worker` dan memakai
+`.env.compose` untuk interpolasi Compose. Untuk `remote-1`, `.env.worker`
+menyediakan `PROFILE_ROOT` dan sekaligus menjadi sumber token worker. Kedua
+file runtime lokal dibatasi permission root. Installer dan supervisor memakai
 `--env-file` yang sama agar Compose menemukan project dan konfigurasi worker
 yang sedang berjalan.
 

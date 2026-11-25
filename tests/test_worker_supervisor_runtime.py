@@ -70,6 +70,7 @@ class WorkerSupervisorRuntimeTests(unittest.TestCase):
             "worker": "remote-1",
             "compose_root": "/www/wwwroot/downloads/bot",
             "compose_file": "docker-compose.worker.yml",
+            "compose_env_file": ".env.worker",
             "project": "worker-project",
             "service": "worker",
         }
@@ -133,6 +134,29 @@ class WorkerSupervisorRuntimeTests(unittest.TestCase):
         self.assertEqual(project, "tme3bot-worker-local")
         self.assertEqual(container_id, "worker-container")
         self.assertIn("--env-file", run.call_args_list[0].args[0])
+
+    def test_remote_one_target_uses_worker_env_for_compose_interpolation(self):
+        expected = FIXED_TARGETS["remote-1"]
+        target = {"worker": "remote-1", **expected, "project": "bot"}
+        labels = {
+            "com.docker.compose.project": "bot",
+            "com.docker.compose.project.working_dir": "/www/wwwroot/downloads/bot",
+            "com.docker.compose.service": "worker",
+        }
+        responses = [
+            subprocess.CompletedProcess([], 0, "worker-container\n", ""),
+            subprocess.CompletedProcess(
+                [], 0, json.dumps([{"Config": {"Labels": labels}}]), ""
+            ),
+        ]
+        with patch.object(Path, "is_file", return_value=True), patch(
+            "tme3bot.worker.supervisor.subprocess.run", side_effect=responses
+        ) as run:
+            DockerComposeWorkerAdapter(target).validate_target()
+
+        command = run.call_args_list[0].args[0]
+        self.assertIn("--env-file", command)
+        self.assertIn(".env.worker", command)
 
     def test_restart_stops_and_starts_only_after_validating_fixed_target(self):
         self.supervisor.run_once()
