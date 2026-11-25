@@ -103,6 +103,7 @@ class BackendContext:
     bot: Any = None
     worker_dispatcher: Any = None
     worker_health_monitor: Any = None
+    worker_restart_service: Any = None
     storage_maintenance: Any = None
     database_compaction_service: Any = None
     runtime_settings: Any = None

@@ -2700,7 +2700,7 @@ class ControlPlaneTests(unittest.TestCase):
         now = utc_now()
         first = self._create_stale_running_job("stale-utility-1", now=now)
         second = self._create_stale_running_job("stale-utility-2", now=now)
-        self.dispatcher.health_result = {"healthy": False}
+        self.dispatcher.health_result = {"healthy": True}
 
         self.control._recover_stale_jobs(now=now)
 
@@ -2710,20 +2710,25 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.cancelled_jobs, [])
         self.assertIsNone(self.control._worker_unresponsive_reason("local"))
 
-    def test_stale_job_is_cancelled_and_worker_marked_unresponsive_if_probe_fails(self):
+    def test_stale_job_stays_active_and_worker_is_gated_after_two_failed_probes(self):
         now = utc_now()
         job = self._create_stale_running_job("stale-utility-offline", now=now)
         self.dispatcher.health_error = TimeoutError("worker health probe timed out")
 
         self.control._recover_stale_jobs(now=now)
 
-        cancelled = self.jobs.get(job.id)
-        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
-        self.assertEqual(cancelled.error["code"], "WORKER_UNRESPONSIVE")
-        self.assertNotIn("event_latency_ms", cancelled.progress)
-        self.assertEqual(self.dispatcher.health_checks, ["local"])
+        still_active = self.jobs.get(job.id)
+        self.assertEqual(still_active.status, JobStatus.RUNNING)
+        self.assertIsNone(still_active.error)
+        self.assertEqual(self.dispatcher.health_checks, ["local", "local"])
         self.assertEqual(self.dispatcher.cancelled_jobs, [])
         self.assertIsNotNone(self.control._worker_unresponsive_reason("local"))
+        self.assertEqual(
+            self.dispatcher.health_checks,
+            ["local"] * 4,
+            "admission confirms the worker again before holding new jobs",
+        )
+        self.assertTrue(self.jobs.has_active("default"))
 
     def test_non_stale_job_does_not_probe_worker(self):
         now = utc_now()
@@ -2900,7 +2905,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(terminal.progress_sequence, 3)
         self.assertEqual(self.jobs.events(job.id)[-1].event_type, "cancelled")
 
-    def test_accepted_high_latency_cancel_does_not_clear_concurrent_quarantine(self):
+    def test_accepted_high_latency_cancel_does_not_quarantine_healthy_worker(self):
         class Health:
             def __init__(self):
                 self.unresponsive = []
@@ -2943,14 +2948,15 @@ class ControlPlaneTests(unittest.TestCase):
                 )
                 return True
 
+            def check_worker_fast(self, worker, *, timeout=2.5):
+                del worker, timeout
+                return {"healthy": True}
+
         self.control.dispatcher = RacingDispatcher()
         accepted = self.control._cancel_high_latency_job(job, 3_000)
 
         self.assertIn(accepted.status, {JobStatus.DISPATCHED, JobStatus.RUNNING})
-        self.assertEqual(
-            self.control._worker_unresponsive_reason("local"),
-            "event_backlog_cancel_unconfirmed",
-        )
+        self.assertIsNone(self.control._worker_unresponsive_reason("local"))
 
     def test_recovery_loop_handles_already_stored_high_latency(self):
         control = ControlPlane(
@@ -3028,7 +3034,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(completed.status, JobStatus.SUCCEEDED)
 
-    def test_stale_job_is_kept_while_worker_responds_then_cancelled_if_probe_fails(self):
+    def test_stale_job_is_kept_when_probe_fails_until_worker_stop_is_confirmed(self):
         control = ControlPlane(
             self.jobs,
             self.dispatcher,
@@ -3080,29 +3086,30 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.dispatcher.health_error = TimeoutError("worker health probe timed out")
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=42))
-        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
-        self.assertEqual(self.jobs.get(job.id).error["code"], "WORKER_UNRESPONSIVE")
-        self.assertEqual(self.dispatcher.health_checks, ["local", "local"])
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertIsNone(self.jobs.get(job.id).error)
+        self.assertEqual(self.dispatcher.health_checks, ["local"] * 3)
         self.assertEqual(self.dispatcher.cancelled_jobs, [])
         self.assertEqual(
             control._worker_unresponsive_reason("local"),
             "stale_worker_probe_unavailable",
         )
-        self.assertTrue(self.jobs.get(job.id).progress["outcome_uncertain"])
-        self.assertFalse(self.jobs.has_active("default"))
+        self.assertEqual(self.dispatcher.health_checks, ["local"] * 5)
+        self.assertTrue(self.jobs.has_active("default"))
 
         late = control.append_worker_event(
             JobEvent(
                 job_id=job.id,
-                sequence=3,
+                sequence=4,
                 status=JobStatus.RUNNING,
-                event_type="late_running",
+                event_type="progress.snapshot",
+                progress={"heartbeat": True},
             )
         )
-        self.assertEqual(late.status, JobStatus.CANCELLED)
+        self.assertEqual(late.status, JobStatus.RUNNING)
 
-        # A terminal worker event finally confirms the process is gone and
-        # releases the resource fence, but does not erase the uncertain failure.
+        # The worker terminal event ends the job; an earlier health failure
+        # cannot release its resource fence or pretend the process stopped.
         control.append_worker_event(
             JobEvent(
                 job_id=job.id,
@@ -3113,10 +3120,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertFalse(self.jobs.has_active("default"))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
-        self.assertEqual(
-            self.jobs.get(job.id).result["late_worker_terminal"]["status"],
-            "cancelled",
-        )
+        self.assertEqual(self.jobs.events(job.id)[-1].event_type, "cancelled")
 
     def test_stale_watchdog_revalidates_fresh_progress_before_failing(self):
         control = ControlPlane(

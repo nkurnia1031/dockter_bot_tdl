@@ -128,4 +128,65 @@ describe('WorkersPage TTS health controls', () => {
       expect.objectContaining({ tdl_upload_stall_timeout_seconds: 2400 }),
     ));
   });
+
+  it('offers restart only after failed fresh probes and polls the supervisor operation', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    apiMock.mockImplementation(async (path: string) => {
+      if (path === '/workers') return { items: [{ name: 'remote-tts', url: 'http://worker', enabled: true, health_status: 'offline', supervisor_online: true }] };
+      if (path === '/workers/remote-tts/restart/op-1') {
+        return {
+          id: 'op-1', worker: 'remote-tts', status: 'succeeded', active_job_count: 2,
+          result: { cancelled_job_ids: ['job-1', 'job-2'] },
+        };
+      }
+      if (path.endsWith('/settings')) return workerSettings;
+      throw new Error(`Unexpected GET ${path}`);
+    });
+    postMock.mockImplementation(async (path: string) => {
+      if (path.endsWith('/restart/preflight')) {
+        return {
+          worker: 'remote-tts', health_status: 'offline', health_probe_attempts: 2,
+          restart_probe_confirmed: true, supervisor_online: true, active_job_count: 2,
+          restart_available: true, reason_code: '',
+        };
+      }
+      if (path.endsWith('/restart')) {
+        return { id: 'op-1', worker: 'remote-tts', status: 'queued', active_job_count: 2 };
+      }
+      return { worker: 'remote-tts', slot: 2, accepted: true, status: 'restarting' };
+    });
+
+    render(WorkersPage);
+    await screen.findByText('remote-tts');
+    await fireEvent.click(screen.getByRole('button', { name: 'Restart worker' }));
+    expect(await screen.findByText(/2 job aktif akan ditandai cancelled/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Restart dan batalkan job aktif' }));
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith('/workers/remote-tts/restart', {}));
+    expect(await screen.findByText(/2 job dibatalkan setelah container berhenti/)).toBeTruthy();
+    expect(apiMock).toHaveBeenCalledWith('/workers/remote-tts/restart/op-1');
+  });
+
+  it('does not offer a restart when the worker still responds', async () => {
+    postMock.mockResolvedValue({
+      worker: 'remote-tts', health_status: 'ready', health_probe_attempts: 2,
+      restart_probe_confirmed: false, supervisor_online: true, active_job_count: 0,
+      restart_available: false, reason_code: 'WORKER_REACHABLE',
+    });
+
+    render(WorkersPage);
+    await screen.findByText('remote-tts');
+    await fireEvent.click(screen.getByRole('button', { name: 'Restart worker' }));
+
+    expect(await screen.findByText('Worker masih merespons; restart tidak diperlukan.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Restart dan batalkan job aktif' })).toBeNull();
+    expect(postMock).not.toHaveBeenCalledWith('/workers/remote-tts/restart', {});
+  });
 });

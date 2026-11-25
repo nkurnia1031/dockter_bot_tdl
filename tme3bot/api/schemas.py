@@ -171,6 +171,13 @@ class WorkerResponse(ApiResponse):
     enabled: bool = True
     health_status: str = "unknown"
     health_checked_at: str | None = None
+    health_probe_failures: int = 0
+    restart_probe_confirmed: bool = False
+    supervisor_online: bool = False
+    supervisor_seen_at: str | None = None
+    restart_operation_id: str | None = None
+    restart_status: str | None = None
+    restart_active_job_count: int = 0
 
 
 class WorkerListResponse(ApiResponse):

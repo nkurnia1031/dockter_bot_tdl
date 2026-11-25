@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 from tme3bot.application.ports import JobRepository, WorkerDispatcher
+from tme3bot.application.worker_health import probe_worker_health
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.background_schedule import run_event_driven_loop
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
@@ -103,6 +104,7 @@ class ControlPlane:
         gateway_mode: str = "full",
         gateway_lite_local_stack_enabled: bool = False,
         worker_health_cache=None,
+        worker_restart_store=None,
         scheduler_recovery_seconds: float = 2.0,
     ) -> None:
         self.jobs = jobs
@@ -127,6 +129,7 @@ class ControlPlane:
             gateway_lite_local_stack_enabled
         )
         self.worker_health_cache = worker_health_cache
+        self.worker_restart_store = worker_restart_store
         self.scheduler_recovery_seconds = max(0.1, float(scheduler_recovery_seconds))
         self._clock = utc_now
         self.job_stall_timeout_seconds = max(0, int(job_stall_timeout_seconds))
@@ -498,19 +501,90 @@ class ControlPlane:
         self, worker: str, *, health_snapshot: Any = _WORKER_HEALTH_UNSET
     ) -> str | None:
         name = str(worker or "").strip().lower()
-        with self._stale_job_lock:
-            reason = self._unresponsive_workers.get(name)
-        if reason:
-            return reason
+        restarting = getattr(self.worker_restart_store, "has_active_restart", None)
+        if callable(restarting) and restarting(name):
+            return "worker_restart_in_progress"
+        should_probe = health_snapshot is _WORKER_HEALTH_UNSET
         if health_snapshot is _WORKER_HEALTH_UNSET:
             snapshotter = getattr(self.worker_health_cache, "snapshot", None)
             health_snapshot = snapshotter(name) if callable(snapshotter) else None
         if (
             isinstance(health_snapshot, dict)
-            and health_snapshot.get("status") == "unresponsive"
+            and health_snapshot.get("status") == "ready"
+            and health_snapshot.get("healthy") is True
         ):
-            return str(health_snapshot.get("reason") or "worker_unresponsive")
+            self._clear_worker_unresponsive(name)
+            return None
+        with self._stale_job_lock:
+            reason = self._unresponsive_workers.get(name)
+        snapshot_unresponsive = (
+            isinstance(health_snapshot, dict)
+            and health_snapshot.get("status") in {"offline", "unresponsive"}
+        )
+        if not reason and not snapshot_unresponsive:
+            return None
+
+        # A delayed event or old health snapshot is not a reachability result.
+        # Confirm with at most two fresh probes before holding worker admission.
+        probe_confirmed = bool(
+            isinstance(health_snapshot, dict)
+            and health_snapshot.get("restart_probe_confirmed") is True
+        )
+        if (
+            should_probe
+            and isinstance(health_snapshot, dict)
+            and health_snapshot.get("status") == "offline"
+            and probe_confirmed
+            and health_snapshot.get("age_seconds") is not None
+        ):
+            # WorkerHealthMonitor already ran two probes and keeps this
+            # confirmation only while its snapshot is fresh. Reuse it across
+            # queued jobs instead of probing the same offline worker again.
+            should_probe = False
+        if should_probe or (snapshot_unresponsive and not probe_confirmed):
+            health_snapshot = self._probe_worker_health_snapshot(name)
+        if (
+            isinstance(health_snapshot, dict)
+            and health_snapshot.get("status") == "ready"
+            and health_snapshot.get("healthy") is True
+        ):
+            self._clear_worker_unresponsive(name)
+            return None
+        status = (
+            str((health_snapshot or {}).get("status") or "").strip().lower()
+            if isinstance(health_snapshot, dict)
+            else ""
+        )
+        probe_confirmed = bool(
+            isinstance(health_snapshot, dict)
+            and health_snapshot.get("restart_probe_confirmed") is True
+        )
+        if status in {"offline", "unresponsive"} and probe_confirmed:
+            if reason:
+                return reason
+            return str((health_snapshot or {}).get("reason") or "worker_offline")
+        # Unknown/stale/one failed probe does not quarantine a worker. The
+        # actual requested operation is allowed to verify its own endpoint.
         return None
+
+    def _probe_worker_health_snapshot(self, worker: str) -> dict[str, Any] | None:
+        name = str(worker or "").strip().lower()
+        probe = getattr(self.worker_health_cache, "probe_worker", None)
+        if callable(probe):
+            try:
+                result = probe(name)
+            except Exception:
+                result = None
+            if isinstance(result, dict):
+                status = str(result.get("status") or "").strip().lower()
+                if status in {"ready", "offline", "unresponsive", "disabled", "unknown", "stale"}:
+                    return result
+                return None
+
+        checker = getattr(self.dispatcher, "check_worker_fast", None)
+        if not callable(checker):
+            return None
+        return probe_worker_health(checker, name)
 
     def _require_worker_responsive(
         self, worker: str, *, health_snapshot: Any = _WORKER_HEALTH_UNSET
@@ -519,11 +593,23 @@ class ControlPlane:
             worker, health_snapshot=health_snapshot
         )
         if reason:
+            if reason == "worker_restart_in_progress":
+                raise DomainError(
+                    "WORKER_RESTART_IN_PROGRESS",
+                    f"Worker {worker} sedang direstart; job baru ditahan sampai operasi selesai.",
+                    status_code=409,
+                    details={"worker": str(worker), "health": "restarting"},
+                )
+            offline = reason == "worker_offline"
             raise DomainError(
-                "WORKER_UNRESPONSIVE",
-                f"Worker {worker} tidak merespons; job baru ditahan sampai proses lama terkonfirmasi berhenti.",
+                "WORKER_OFFLINE" if offline else "WORKER_UNRESPONSIVE",
+                f"Worker {worker} tidak dapat dijangkau atau tidak sehat. Periksa worker dan restart jika diperlukan.",
                 status_code=503,
-                details={"worker": str(worker), "health": "unresponsive", "reason": reason},
+                details={
+                    "worker": str(worker),
+                    "health": "offline" if offline else "unresponsive",
+                    "reason": reason,
+                },
             )
 
     def _refresh_worker_unresponsive_state(self, worker: str) -> None:
@@ -881,29 +967,15 @@ class ControlPlane:
             )
         snapshotter = getattr(self.worker_health_cache, "snapshot", None)
         snapshot = snapshotter(worker_name) if callable(snapshotter) else None
-        status = str(snapshot.get("status") or "unknown") if isinstance(snapshot, dict) else "unknown"
+        if not (
+            isinstance(snapshot, dict)
+            and snapshot.get("status") == "ready"
+            and snapshot.get("healthy") is True
+        ):
+            snapshot = self._probe_worker_health_snapshot(worker_name)
+        # Unknown/stale snapshots are not proof of a dead worker. The shared
+        # gate performs up to two fresh probes and blocks only when both fail.
         self._require_worker_responsive(worker_name, health_snapshot=snapshot)
-        if status == "unknown":
-            raise DomainError(
-                "WORKER_HEALTH_UNKNOWN",
-                "Status worker belum tersedia. Tunggu pemeriksaan health berikutnya lalu coba lagi.",
-                status_code=503,
-                details={"worker": worker_name, "health": status},
-            )
-        if status == "stale":
-            raise DomainError(
-                "WORKER_HEALTH_STALE",
-                "Status health worker sudah kedaluwarsa. Tunggu pemeriksaan berikutnya lalu coba lagi.",
-                status_code=503,
-                details={"worker": worker_name, "health": status},
-            )
-        if status != "ready":
-            raise DomainError(
-                "WORKER_OFFLINE",
-                "Worker sedang offline dan tidak dapat menerima job baru.",
-                status_code=503,
-                details={"worker": worker_name, "health": status},
-            )
 
     def _worker_ack_wait_timed_out(self, stored: dict[str, Any]) -> bool:
         if self.gateway_mode != "lite":
@@ -3971,13 +4043,14 @@ class ControlPlane:
         )
 
     def _stale_worker_responds(self, worker: str, *, now) -> bool | None:
-        """Check a stale job's worker once, reusing Lite's cached health probe.
+        """Check a stale job's worker without treating event delay as process death.
 
         The normal path is a read from WorkerHealthMonitor's existing snapshot.
-        A targeted HTTP probe is only used when that snapshot cannot confirm the
-        worker is responding, and is rate-limited per worker rather than per
-        job. A response proves the worker API is reachable even if its health
-        payload reports a degraded service.
+        A targeted health probe is only used when that snapshot cannot confirm
+        the worker is responding, and is rate-limited per worker rather than per
+        job. Only two failed probes confirm unavailability; stale jobs are never
+        terminalized here because only a confirmed Docker stop proves that the
+        worker process was interrupted.
         """
         name = str(worker or "").strip().lower()
         if not name:
@@ -4002,25 +4075,51 @@ class ControlPlane:
                 if (now - checked_at).total_seconds() < cooldown_seconds:
                     return responds
 
+        probe = getattr(self.worker_health_cache, "probe_worker", None)
+        if callable(probe):
+            try:
+                result = probe(name)
+            except Exception:
+                result = None
+            if isinstance(result, dict):
+                if result.get("status") == "ready" and result.get("healthy") is True:
+                    responds: bool | None = True
+                elif (
+                    result.get("status") == "offline"
+                    and result.get("restart_probe_confirmed") is True
+                ):
+                    responds = False
+                else:
+                    responds = None
+                with self._stale_job_lock:
+                    self._stale_worker_probe_results[name] = (now, responds)
+                return responds
+
         checker = getattr(self.dispatcher, "check_worker_fast", None)
         if not callable(checker):
             return None
-        try:
-            checker(name)
-        except Exception:
+        result = probe_worker_health(checker, name)
+        if result.get("status") == "ready" and result.get("healthy") is True:
+            responds: bool | None = True
+        elif (
+            result.get("status") == "offline"
+            and result.get("restart_probe_confirmed") is True
+        ):
             responds = False
         else:
-            responds = True
+            responds = None
         with self._stale_job_lock:
             self._stale_worker_probe_results[name] = (now, responds)
         return responds
 
     def _recover_stale_jobs(self, *, now=None) -> None:
-        """Mark stale jobs cancelled only when their worker fails a health probe.
+        """Keep stale jobs active until worker stop is confirmed by its supervisor.
 
         Event delivery latency is telemetry, not proof that the worker stopped
-        responding. Lite reuses its background health snapshot; only an unknown
-        or stale snapshot causes one bounded probe per worker cooldown window.
+        responding. A stale progress timestamp may update worker reachability,
+        but it never cancels a job or releases its resource lease. The explicit
+        restart flow terminalizes jobs only after Docker confirms the container
+        stopped.
         """
         current_time = now or utc_now()
         active_statuses = (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value)
@@ -4127,31 +4226,16 @@ class ControlPlane:
                     )
                 if worker_probe_results[worker] is not False:
                     # A responsive worker may be running a slow command or
-                    # delivering telemetry late. Keep the job and its lease.
+                    # delivering telemetry late. An inconclusive probe also
+                    # cannot prove that the process stopped.
                     self._stale_cancel_requested.pop(job.id, None)
                     continue
-
-                # Recheck under the same lock used by progress updates. Do not
-                # terminalize a job if fresh worker progress arrived while the
-                # single worker-level probe was in flight.
+                # Preserve the job and its lease until Docker stop is confirmed.
+                # This prevents a temporary health/API failure from making a
+                # still-running process look cancelled to the rest of the app.
                 with self._stale_job_lock:
-                    latest = self.jobs.get(job.id)
-                    if latest is None or latest.status.terminal:
-                        self._stale_cancel_requested.pop(job.id, None)
-                        continue
-                    age = (
-                        current_time - (latest.updated_at or latest.created_at)
-                    ).total_seconds()
-                    if age <= self.job_stall_timeout_seconds:
-                        self._stale_cancel_requested.pop(job.id, None)
-                        continue
-                    latest = self._force_cancel_unresponsive_job(
-                        latest,
-                        latency_ms=None,
-                        signal_status=None,
-                        reason="stale_worker_probe_unavailable",
-                    )
-                    forced = forced or latest.status == JobStatus.CANCELLED
+                    self._unresponsive_workers[worker] = "stale_worker_probe_unavailable"
+                    self._stale_cancel_requested.pop(job.id, None)
 
         with self._stale_job_lock:
             for job_id in tuple(self._stale_cancel_requested):
@@ -4260,8 +4344,14 @@ class ControlPlane:
                     limit=200,
                 )
             )
+            worker_availability: dict[str, str | None] = {}
             for queued in queued_jobs:
-                if self._worker_unresponsive_reason(queued.worker):
+                worker_name = str(queued.worker or "").strip().lower()
+                if worker_name not in worker_availability:
+                    worker_availability[worker_name] = self._worker_unresponsive_reason(
+                        worker_name
+                    )
+                if worker_availability[worker_name]:
                     continue
                 command_payload = self.jobs.command_payload(queued.id)
                 if (
@@ -6092,6 +6182,74 @@ class ControlPlane:
             if current.kind == "tts":
                 self._cancel_tts_deliveries(current.id)
             return terminal
+
+    def cancel_worker_jobs_after_restart(
+        self, worker: str, job_ids: list[str], *, operation_id: str
+    ) -> list[str]:
+        """Cancel every active job on a worker after the supervisor confirms stop."""
+        name = str(worker or "").strip().lower()
+        targets = list(dict.fromkeys(str(value) for value in job_ids if str(value)))
+        offset = 0
+        while True:
+            active = self.jobs.list(
+                worker=name,
+                statuses=_ACTIVE_PROGRESS_REFRESH_STATUSES,
+                archived=False,
+                offset=offset,
+                limit=200,
+            )
+            targets.extend(
+                job.id for job in active
+                if job.worker == name and not job.status.terminal
+            )
+            if len(active) < 200:
+                break
+            offset += len(active)
+        cancelled: list[str] = []
+        for job_id in dict.fromkeys(targets):
+            current = self.jobs.get(job_id)
+            if current is None or current.worker != name or current.status.terminal:
+                continue
+            progress = dict(current.progress) if isinstance(current.progress, dict) else {}
+            progress.pop("backend_telemetry", None)
+            progress.update(
+                {
+                    "phase": "cancelled",
+                    "terminal_phase": "cancelled",
+                    "finished_at": utc_now().isoformat(),
+                    "worker_confirmation": "container_restarted",
+                    "worker_restart": {
+                        "operation_id": str(operation_id),
+                        "container_stopped": True,
+                    },
+                    "outcome_uncertain": True,
+                    "reconciliation_required": True,
+                }
+            )
+            terminal = self.append_worker_event(
+                JobEvent(
+                    job_id=current.id,
+                    sequence=self._next_job_event_sequence(
+                        current.id, fallback=current
+                    ),
+                    status=JobStatus.CANCELLED,
+                    event_type="worker_restart_cancelled",
+                    progress=progress,
+                    error={
+                        "code": "WORKER_RESTARTED",
+                        "message": (
+                            "Worker di-restart oleh operator. Job dihentikan; "
+                            "hasil eksternal mungkin belum pasti."
+                        ),
+                    },
+                ),
+                dispatch_pending=False,
+            )
+            if terminal.status == JobStatus.CANCELLED:
+                cancelled.append(current.id)
+                if current.kind == "tts":
+                    self._cancel_tts_deliveries(current.id)
+        return cancelled
 
     def cancel_job(self, actor: Actor, job_id: str) -> Job:
         job = self.jobs.get(job_id)

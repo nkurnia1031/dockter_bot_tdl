@@ -57,7 +57,34 @@ class WorkerHealthMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "offline")
         self.assertEqual(snapshot["healthy"], False)
 
-    def test_unresponsive_override_survives_probe_until_cleared(self):
+    def test_on_demand_unhealthy_result_requires_two_failed_probes(self):
+        calls = []
+        self.monitor.checker = lambda name: calls.append(name) or {"healthy": False}
+
+        snapshot = self.monitor.probe_worker("remote-1")
+
+        self.assertEqual(calls, ["remote-1", "remote-1"])
+        self.assertEqual(snapshot["status"], "offline")
+        self.assertEqual(snapshot["health_probe_failures"], 2)
+        self.assertTrue(snapshot["restart_probe_confirmed"])
+
+    def test_snapshot_does_not_turn_unknown_or_stale_into_unresponsive(self):
+        self.monitor.mark_unresponsive(
+            "remote-1", reason="operator_stop_cancel_unconfirmed"
+        )
+
+        self.assertEqual(self.monitor.snapshot("remote-1")["status"], "unknown")
+        self.assertTrue(
+            self.monitor.snapshot("remote-1")["cancellation_unconfirmed"]
+        )
+
+        self.monitor.refresh_once()
+        self.now += timedelta(seconds=61)
+        snapshot = self.monitor.snapshot("remote-1")
+        self.assertEqual(snapshot["status"], "stale")
+        self.assertTrue(snapshot["cancellation_unconfirmed"])
+
+    def test_healthy_probe_does_not_keep_worker_quarantined_for_old_cancel(self):
         self.monitor.refresh_once()
         self.monitor.mark_unresponsive(
             "remote-1", reason="event_backlog_cancel_unconfirmed"
@@ -65,14 +92,26 @@ class WorkerHealthMonitorTests(unittest.TestCase):
 
         self.monitor.refresh_once()
         snapshot = self.monitor.snapshot("remote-1")
-        self.assertEqual(snapshot["status"], "unresponsive")
+        self.assertEqual(snapshot["status"], "ready")
+        self.assertTrue(snapshot["healthy"])
+        self.assertTrue(snapshot["cancellation_unconfirmed"])
+
+        self.monitor.clear_unresponsive("remote-1")
+        self.assertEqual(self.monitor.snapshot("remote-1")["status"], "ready")
+
+    def test_failed_probe_keeps_unconfirmed_cancel_visible(self):
+        self.monitor.mark_unresponsive(
+            "remote-1", reason="event_backlog_cancel_unconfirmed"
+        )
+        self.monitor.checker = lambda _name: {"healthy": False}
+        self.monitor.refresh_once()
+
+        snapshot = self.monitor.snapshot("remote-1")
+        self.assertEqual(snapshot["status"], "offline")
         self.assertEqual(
             snapshot["reason"], "event_backlog_cancel_unconfirmed"
         )
         self.assertFalse(snapshot["healthy"])
-
-        self.monitor.clear_unresponsive("remote-1")
-        self.assertEqual(self.monitor.snapshot("remote-1")["status"], "ready")
 
 
 if __name__ == "__main__":

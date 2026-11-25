@@ -9,7 +9,7 @@ from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from fastapi import Depends, File, Form, Response, UploadFile
+from fastapi import Depends, File, Form, Header, Response, UploadFile
 from tme3bot.api.schemas import (
     ObjectResponse,
     WorkerEnabledRequest,
@@ -2340,10 +2340,30 @@ def register_workers(app, context, *, current_actor):
     @app.get("/api/v1/workers", response_model=WorkerListResponse)
     def list_workers(actor=Depends(current_actor)):
         monitor = getattr(context, "worker_health_monitor", None)
+        restart_service = getattr(context, "worker_restart_service", None)
         registered_workers = context.worker_registry.list()
         gateway_mode = getattr(context.config, "gateway_mode", "full")
-        return {
-            "items": [
+        items = []
+        for name in worker_names_for_config(
+            registered_workers,
+            context.config,
+            gateway_mode=gateway_mode,
+        ):
+            health = monitor.snapshot(name) if monitor is not None else {}
+            supervisor_online, supervisor_seen_at = False, None
+            restart_status = {}
+            if restart_service is not None:
+                try:
+                    restart_status = restart_service.worker_status(name)
+                    supervisor_online = bool(restart_status.get("supervisor_online"))
+                    supervisor_seen_at = restart_status.get("supervisor_seen_at")
+                except Exception as exc:
+                    logging.getLogger(__name__).info(
+                        "Worker restart status unavailable for %s (%s)",
+                        name,
+                        type(exc).__name__,
+                    )
+            items.append(
                 {
                     "name": name,
                     "url": registered_workers[name]["url"],
@@ -2351,24 +2371,73 @@ def register_workers(app, context, *, current_actor):
                     "enabled": bool(registered_workers[name].get("enabled", True)),
                     "selected": name
                     == context.profile_manager.worker_route(actor.profile),
-                    "health_status": (
-                        monitor.snapshot(name).get("status", "unknown")
-                        if monitor is not None
-                        else "unknown"
-                    ),
-                    "health_checked_at": (
-                        monitor.snapshot(name).get("checked_at")
-                        if monitor is not None
-                        else None
+                    "health_status": health.get("status", "unknown"),
+                    "health_checked_at": health.get("checked_at"),
+                    "health_probe_failures": int(health.get("health_probe_failures") or 0),
+                    "restart_probe_confirmed": bool(health.get("restart_probe_confirmed")),
+                    "supervisor_online": supervisor_online,
+                    "supervisor_seen_at": supervisor_seen_at,
+                    "restart_operation_id": restart_status.get("restart_operation_id"),
+                    "restart_status": restart_status.get("restart_status"),
+                    "restart_active_job_count": int(
+                        restart_status.get("restart_active_job_count") or 0
                     ),
                 }
-                for name in worker_names_for_config(
-                    registered_workers,
-                    context.config,
-                    gateway_mode=gateway_mode,
-                )
-            ]
-        }
+            )
+        return {"items": items}
+
+    def _worker_restart_service():
+        service = getattr(context, "worker_restart_service", None)
+        if service is None:
+            raise DomainError(
+                "WORKER_SUPERVISOR_UNAVAILABLE",
+                "Backend belum mendukung restart worker lewat supervisor host.",
+                status_code=503,
+            )
+        return service
+
+    @app.post("/api/v1/workers/{name}/restart/preflight")
+    def worker_restart_preflight(name: str, actor=Depends(current_actor)):
+        del actor
+        _require_worker_available_in_mode(name)
+        return _worker_restart_service().preflight(name)
+
+    @app.post("/api/v1/workers/{name}/restart")
+    def worker_restart_request(name: str, actor=Depends(current_actor)):
+        _require_worker_available_in_mode(name)
+        return _worker_restart_service().request_restart(
+            name, actor_user_id=int(actor.telegram_user_id)
+        )
+
+    @app.get("/api/v1/workers/{name}/restart/{operation_id}")
+    def worker_restart_operation(name: str, operation_id: str, actor=Depends(current_actor)):
+        del actor
+        _require_worker_available_in_mode(name)
+        return _worker_restart_service().operation(name, operation_id)
+
+    @app.get(
+        "/internal/v1/worker-supervisors/{name}/commands/next",
+        include_in_schema=False,
+    )
+    def worker_supervisor_next_command(
+        name: str,
+        worker_token: str = Header(default="", alias="X-Worker-Token"),
+    ):
+        return _worker_restart_service().poll_supervisor(name, worker_token)
+
+    @app.post(
+        "/internal/v1/worker-supervisors/{name}/operations/{operation_id}/result",
+        include_in_schema=False,
+    )
+    def worker_supervisor_report_result(
+        name: str,
+        operation_id: str,
+        body: dict,
+        worker_token: str = Header(default="", alias="X-Worker-Token"),
+    ):
+        return _worker_restart_service().report_supervisor_result(
+            name, worker_token, operation_id, body
+        )
 
     @app.get("/api/v1/profiles/local")
     def local_profile_catalog(actor=Depends(current_actor)):

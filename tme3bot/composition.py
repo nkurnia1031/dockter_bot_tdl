@@ -11,6 +11,7 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService
 from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.application.worker_health import WorkerHealthMonitor
+from tme3bot.application.worker_restart import WorkerRestartCoordinator
 from tme3bot.background_schedule import GatewayBackgroundSchedule
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
@@ -27,6 +28,7 @@ from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
+from tme3bot.infrastructure.worker_restart_store import SqliteWorkerRestartStore
 from tme3bot.infrastructure.queue_transport import (
     QueueCommandService,
     QueueOutboxPublisher,
@@ -196,6 +198,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     worker_health_monitor = WorkerHealthMonitor(
         registry, dispatcher.check_worker_fast
     )
+    worker_restart_store = SqliteWorkerRestartStore(config.storage_db_file)
     profile_provisioner = ProfileProvisioningService(
         profile_vault,
         profiles,
@@ -247,7 +250,16 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         gateway_mode=config.gateway_mode,
         gateway_lite_local_stack_enabled=config.gateway_lite_local_stack_enabled,
         worker_health_cache=worker_health_monitor,
+        worker_restart_store=worker_restart_store,
         scheduler_recovery_seconds=background_schedule.job_recovery_seconds,
+    )
+    worker_restart_service = WorkerRestartCoordinator(
+        worker_restart_store,
+        registry,
+        worker_health_monitor,
+        jobs,
+        control_plane,
+        dispatcher=dispatcher,
     )
     control_plane.add_event_observer(operation_service.on_job_event)
     control_plane.start_scheduler()
@@ -351,6 +363,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         bot=bot,
         worker_dispatcher=dispatcher,
         worker_health_monitor=worker_health_monitor,
+        worker_restart_service=worker_restart_service,
         storage_maintenance=storage_maintenance,
         database_compaction_service=database_compaction_service,
         runtime_settings=runtime_settings,

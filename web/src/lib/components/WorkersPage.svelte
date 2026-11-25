@@ -6,7 +6,20 @@
   import { session } from '$lib/session.svelte';
   import { CheckCircle2, Pencil, Plus, RefreshCw, Server, Settings2, Trash2 } from '@lucide/svelte';
 
-  type Worker = { name: string; url: string; public_url?: string; enabled?: boolean; selected?: boolean; healthy?: boolean; latency_ms?: number };
+  type Worker = {
+    name: string; url: string; public_url?: string; enabled?: boolean; selected?: boolean;
+    healthy?: boolean; latency_ms?: number; health_status?: string; supervisor_online?: boolean;
+    restart_operation_id?: string | null; restart_status?: string | null; restart_active_job_count?: number;
+  };
+  type RestartPreflight = {
+    worker: string; health_status: string; health_probe_attempts: number;
+    restart_probe_confirmed: boolean; supervisor_online: boolean; active_job_count: number;
+    restart_available: boolean; reason_code: string;
+  };
+  type RestartOperation = {
+    id: string; worker: string; status: 'queued' | 'restarting' | 'succeeded' | 'failed';
+    active_job_count: number; result?: { cancelled_job_ids?: string[]; failure_code?: string };
+  };
   type WorkerSettings = {
     worker: string;
     worker_api_token_configured: boolean;
@@ -45,7 +58,124 @@
   let ttsHealth = $state<Record<string, TtsHealth>>({});
   let ttsHealthLoading = $state<Record<string, boolean>>({});
   let ttsRecoveryLoading = $state<Record<string, number | null>>({});
-  async function load() { try { workers = (await api<{items:Worker[]}>('/workers')).items || []; } catch (cause) { message = cause instanceof Error ? cause.message : 'Worker gagal dimuat.'; } }
+  let restartTarget = $state<Worker | null>(null);
+  let restartPreflight = $state<RestartPreflight | null>(null);
+  let restartOperation = $state<RestartOperation | null>(null);
+  let restartModalOpen = $state(false);
+  let restartBusy = $state(false);
+  let restartPollTimer: number | undefined;
+  let restartPollSequence = 0;
+  function clearRestartPoll() {
+    restartPollSequence += 1;
+    if (restartPollTimer !== undefined) window.clearTimeout(restartPollTimer);
+    restartPollTimer = undefined;
+  }
+  function restartReason(code: string): string {
+    return {
+      WORKER_REACHABLE: 'Worker masih merespons; restart tidak diperlukan.',
+      WORKER_HEALTH_UNCONFIRMED: 'Dua probe baru belum memastikan worker offline. Tidak ada restart yang dikirim.',
+      SUPERVISOR_OFFLINE: 'Worker tidak merespons dan supervisor host juga offline. Tidak ada restart yang dikirim.',
+      WORKER_RESTART_IN_PROGRESS: 'Operasi restart untuk worker ini sudah berjalan.',
+    }[code] || 'Restart tidak tersedia. Periksa kesehatan worker dan supervisor host.';
+  }
+  function restartStatusLabel(status?: string | null): string {
+    return ({ queued: 'menunggu supervisor', restarting: 'sedang direstart', succeeded: 'restart selesai', failed: 'restart gagal' } as Record<string, string>)[status || ''] || '';
+  }
+  async function load() {
+    try {
+      workers = (await api<{items:Worker[]}>('/workers')).items || [];
+      const active = workers.find((item) => item.restart_operation_id && ['queued', 'restarting'].includes(item.restart_status || ''));
+      if (active?.restart_operation_id) {
+        if (restartOperation?.id !== active.restart_operation_id) {
+          restartTarget = active;
+          restartOperation = {
+            id: active.restart_operation_id,
+            worker: active.name,
+            status: active.restart_status as RestartOperation['status'],
+            active_job_count: active.restart_active_job_count || 0,
+          };
+        }
+        scheduleRestartPoll(active.name, active.restart_operation_id);
+      }
+    } catch (cause) { message = cause instanceof Error ? cause.message : 'Worker gagal dimuat.'; }
+  }
+  async function prepareRestart(worker: Worker) {
+    if (worker.restart_operation_id) {
+      restartTarget = worker;
+      restartPreflight = null;
+      restartOperation = {
+        id: worker.restart_operation_id,
+        worker: worker.name,
+        status: worker.restart_status as RestartOperation['status'],
+        active_job_count: worker.restart_active_job_count || 0,
+      };
+      restartModalOpen = true;
+      scheduleRestartPoll(worker.name, worker.restart_operation_id);
+      return;
+    }
+    restartTarget = worker;
+    restartPreflight = null;
+    restartOperation = null;
+    restartBusy = true;
+    try {
+      const result = await post<RestartPreflight>(`/workers/${encodeURIComponent(worker.name)}/restart/preflight`, {});
+      if (!result.restart_available) {
+        message = restartReason(result.reason_code);
+        restartTarget = null;
+        return;
+      }
+      restartPreflight = result;
+      restartModalOpen = true;
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Pemeriksaan restart worker gagal.';
+      restartTarget = null;
+    } finally {
+      restartBusy = false;
+    }
+  }
+  async function requestRestart() {
+    if (!restartTarget) return;
+    restartBusy = true;
+    try {
+      const operation = await post<RestartOperation>(`/workers/${encodeURIComponent(restartTarget.name)}/restart`, {});
+      restartOperation = operation;
+      restartPreflight = null;
+      message = `Restart ${restartTarget.name} diminta. Job aktif akan dibatalkan setelah container dipastikan berhenti.`;
+      scheduleRestartPoll(restartTarget.name, operation.id, 0);
+      await load();
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Permintaan restart worker gagal.';
+    } finally {
+      restartBusy = false;
+    }
+  }
+  function scheduleRestartPoll(worker: string, operationId: string, delay = 2500) {
+    if (restartPollTimer !== undefined) window.clearTimeout(restartPollTimer);
+    const sequence = ++restartPollSequence;
+    const poll = async () => {
+      if (sequence !== restartPollSequence) return;
+      try {
+        const result = await api<RestartOperation>(`/workers/${encodeURIComponent(worker)}/restart/${encodeURIComponent(operationId)}`);
+        if (sequence !== restartPollSequence) return;
+        restartOperation = result;
+        if (result.status === 'succeeded' || result.status === 'failed') {
+          restartPollTimer = undefined;
+          restartBusy = false;
+          message = result.status === 'succeeded'
+            ? `Restart ${worker} selesai; ${result.result?.cancelled_job_ids?.length || 0} job ditandai cancelled.`
+            : `Restart ${worker} gagal (${result.result?.failure_code || 'alasan tidak tersedia'}).`;
+          await load();
+          return;
+        }
+        restartPollTimer = window.setTimeout(poll, 2500);
+      } catch (cause) {
+        if (sequence !== restartPollSequence) return;
+        message = cause instanceof Error ? cause.message : 'Status restart worker belum dapat dimuat.';
+        restartPollTimer = window.setTimeout(poll, 5000);
+      }
+    };
+    restartPollTimer = window.setTimeout(poll, delay);
+  }
   async function add() { await post('/workers', { name, url, public_url: publicUrl, token }); name = url = publicUrl = token = ''; message = 'Worker ditambahkan.'; await load(); }
   async function select(worker: Worker) {
     if (worker.enabled === false) return;
@@ -216,7 +346,10 @@
     const refresh = () => load();
     window.addEventListener('tme3:context-changed', refresh);
     load();
-    return () => window.removeEventListener('tme3:context-changed', refresh);
+    return () => {
+      window.removeEventListener('tme3:context-changed', refresh);
+      clearRestartPoll();
+    };
   });
 </script>
 
@@ -228,8 +361,8 @@
     {#each workers as worker}
       <div class="border-b border-[var(--line)] last:border-0">
         <article class="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
-          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Aktif</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 truncate text-xs">Domain link publik: {worker.public_url || 'belum diatur'}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : 'Admission job aktif; kesiapan TTS diperiksa terpisah.'}</p></div>
-          <div class="flex flex-wrap gap-2"><button class="button secondary" onclick={() => select(worker)} disabled={worker.selected || worker.enabled === false}><CheckCircle2 size={15}/>Pilih</button><button class={`button ${worker.enabled === false ? '' : 'danger'}`} onclick={() => toggle(worker)}>{worker.enabled === false ? 'Aktifkan' : 'Nonaktifkan'}</button><button class="button secondary" onclick={() => toggleSettings(worker)}><Settings2 size={15}/>{settingsOpen === worker.name ? 'Tutup' : 'Runtime'}</button><button class="button secondary" onclick={() => { editing = worker; editUrl = worker.url; editPublicUrl = worker.public_url || ''; editToken = ''; editOpen = true; }}><Pencil size={15}/>Edit</button><button class="button ghost text-rose-600" onclick={() => { deleting = worker; deleteOpen = true; }}><Trash2 size={15}/></button></div>
+          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Aktif</span>{/if}{#if worker.restart_status}<span class="badge">{restartStatusLabel(worker.restart_status)}</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 truncate text-xs">Domain link publik: {worker.public_url || 'belum diatur'}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : `Kesehatan: ${worker.health_status || 'unknown'} · supervisor ${worker.supervisor_online ? 'terhubung' : 'offline'}.`}</p></div>
+          <div class="flex flex-wrap gap-2"><button class="button secondary" onclick={() => select(worker)} disabled={worker.selected || worker.enabled === false}><CheckCircle2 size={15}/>Pilih</button><button class={`button ${worker.enabled === false ? '' : 'danger'}`} onclick={() => toggle(worker)}>{worker.enabled === false ? 'Aktifkan' : 'Nonaktifkan'}</button><button class="button secondary" onclick={() => prepareRestart(worker)} disabled={restartBusy}>{#if worker.restart_operation_id}<RefreshCw size={15}/>Lihat restart{:else}<RefreshCw size={15}/>Restart worker{/if}</button><button class="button secondary" onclick={() => toggleSettings(worker)}><Settings2 size={15}/>{settingsOpen === worker.name ? 'Tutup' : 'Runtime'}</button><button class="button secondary" onclick={() => { editing = worker; editUrl = worker.url; editPublicUrl = worker.public_url || ''; editToken = ''; editOpen = true; }}><Pencil size={15}/>Edit</button><button class="button ghost text-rose-600" onclick={() => { deleting = worker; deleteOpen = true; }}><Trash2 size={15}/></button></div>
         </article>
         {#if settingsOpen === worker.name}
           <section class="border-t border-[var(--line)] bg-[var(--panel)] px-5 py-4">
@@ -312,3 +445,19 @@
 
 <Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={editOpen} title={editing ? `Edit ${editing.name}` : 'Edit worker'} size="md">{#if editing}<div class="space-y-3"><label class="block text-sm font-bold">URL API<input class="field mt-2" bind:value={editUrl}/></label><label class="block text-sm font-bold">Domain link publik<input class="field mt-2" bind:value={editPublicUrl} placeholder="https://worker.example.com"/><small class="muted mt-1 block font-normal">Kosongkan untuk menonaktifkan penerbitan link baru.</small></label><label class="block text-sm font-bold">Token API baru<input class="field mt-2" type="password" bind:value={editToken} autocomplete="new-password" placeholder="Kosongkan agar tetap sama"/></label><p class="muted text-xs">Token worker dirotasi melalui koneksi internal. Jika koneksi sama, perubahan langsung berlaku di worker dan gateway.</p></div><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => editOpen = false}>Batal</button><button class="button" onclick={update} disabled={!editUrl}>Simpan</button></div>{/if}</Modal>
 <Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={deleteOpen} title="Hapus worker?" size="sm"><p>Worker <b>{deleting?.name}</b> akan dihapus dari registry. Job yang sudah dibuat tidak dipindahkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => deleteOpen = false}>Batal</button><button class="button danger" onclick={destroy}>Hapus</button></div></Modal>
+<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={restartModalOpen} title={restartOperation ? `Restart ${restartTarget?.name || restartOperation.worker}` : `Konfirmasi restart ${restartTarget?.name || 'worker'}`} size="md">
+  {#if restartOperation}
+    <p class="font-semibold">Status: {restartStatusLabel(restartOperation.status)}.</p>
+    <p class="muted mt-2 text-sm">{restartOperation.status === 'succeeded'
+      ? `${restartOperation.result?.cancelled_job_ids?.length || 0} job dibatalkan setelah container berhenti.`
+      : restartOperation.status === 'failed'
+        ? `Restart gagal: ${restartOperation.result?.failure_code || 'alasan tidak tersedia'}.`
+        : `${restartOperation.active_job_count} job aktif akan dibatalkan setelah Docker mengonfirmasi container berhenti.`}</p>
+    {#if restartOperation.status === 'queued' || restartOperation.status === 'restarting'}<p class="muted mt-2 text-xs">Status diperbarui selama operasi restart berlangsung. Tutup dialog tidak membatalkan operasi.</p>{/if}
+    <div class="mt-5 flex justify-end"><button class="button secondary" onclick={() => restartModalOpen = false}>Tutup</button></div>
+  {:else if restartPreflight}
+    <p class="text-sm">Dua probe terbaru gagal dan supervisor host terhubung.</p>
+    <p class="muted mt-2 text-sm">Restart hanya service worker <b>{restartPreflight.worker}</b>. {restartPreflight.active_job_count} job aktif akan ditandai cancelled dengan hasil tidak pasti setelah container dipastikan berhenti. Job tidak otomatis di-retry.</p>
+    <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => restartModalOpen = false}>Batal</button><button class="button danger" onclick={requestRestart} disabled={restartBusy}>{restartBusy ? 'Meminta...' : 'Restart dan batalkan job aktif'}</button></div>
+  {/if}
+</Modal>

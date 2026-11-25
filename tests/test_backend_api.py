@@ -25,6 +25,8 @@ from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
 from tme3bot.application.runtime_readiness import RuntimeReadinessGate
+from tme3bot.application.worker_health import WorkerHealthMonitor
+from tme3bot.application.worker_restart import WorkerRestartCoordinator
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
@@ -38,6 +40,7 @@ from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
+from tme3bot.infrastructure.worker_restart_store import SqliteWorkerRestartStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.profile_provisioning import ProfileProvisioningStore, build_profile_bundle
@@ -48,6 +51,7 @@ from tme3bot.storage_links import sign_storage_item
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
 from tme3bot.worker.aria2_cookie_relay import Aria2CookieRelayServer
 from tme3bot.worker.aria2_runtime import Aria2Runtime
+from tme3bot.worker.supervisor_auth import derive_supervisor_token
 
 
 class FakeProfiles:
@@ -957,6 +961,194 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(verified.status_code, 200, verified.text)
         self.assertEqual(verified.json()["worker"], "local")
 
+    def test_lite_explorer_and_job_admission_ignore_unconfirmed_cancel_when_worker_is_healthy(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+
+        monitor = WorkerHealthMonitor(
+            self.workers,
+            lambda worker: {"healthy": worker == "local"},
+        )
+        monitor.refresh_once()
+        monitor.mark_unresponsive("local", reason="operator_stop_cancel_unconfirmed")
+        self.control.worker_health_cache = monitor
+
+        tree_calls = []
+        self.dispatcher.workspace_tree = lambda worker, path: (
+            tree_calls.append((worker, path))
+            or {"path": path, "items": [{"name": "ready-folder", "type": "directory"}]}
+        )
+
+        tree = self.client.get(
+            "/api/v1/utility/tree",
+            headers=headers,
+            params={"worker": "local", "path": "/workspace"},
+        )
+
+        self.assertEqual(tree.status_code, 200, tree.text)
+        self.assertEqual(tree.json()["items"][0]["name"], "ready-folder")
+        self.assertEqual(tree_calls, [("local", "/workspace")])
+
+        submitted = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={"utility": "compress", "folders": ["/workspace/archive"], "worker": "local"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(submitted.json()["worker"], "local")
+        self.assertEqual(submitted.json()["status"], "dispatched")
+
+    def test_lite_blocks_worker_requests_after_two_fresh_health_probes_fail(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+
+        probe_calls = []
+        monitor = WorkerHealthMonitor(
+            self.workers,
+            lambda worker: probe_calls.append(worker) or {"healthy": False},
+        )
+        monitor.refresh_once()
+        monitor.mark_unresponsive("local", reason="operator_stop_cancel_unconfirmed")
+        self.control.worker_health_cache = monitor
+        tree_calls = []
+        self.dispatcher.workspace_tree = lambda worker, path: (
+            tree_calls.append((worker, path)) or {"path": path, "items": []}
+        )
+
+        response = self.client.get(
+            "/api/v1/utility/tree",
+            headers=headers,
+            params={"worker": "local", "path": "/workspace"},
+        )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"]["code"], "WORKER_UNRESPONSIVE")
+        self.assertEqual(probe_calls.count("local"), 3)  # one background + two fresh probes
+        self.assertEqual(tree_calls, [])
+
+    def test_lite_blocks_offline_worker_without_cancel_marker(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+
+        probe_calls = []
+        monitor = WorkerHealthMonitor(
+            self.workers,
+            lambda worker: probe_calls.append(worker) or {"healthy": False},
+        )
+        monitor.refresh_once()
+        self.control.worker_health_cache = monitor
+        tree_calls = []
+        self.dispatcher.workspace_tree = lambda worker, path: (
+            tree_calls.append((worker, path)) or {"path": path, "items": []}
+        )
+
+        response = self.client.get(
+            "/api/v1/utility/tree",
+            headers=headers,
+            params={"worker": "local", "path": "/workspace"},
+        )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"]["code"], "WORKER_OFFLINE")
+        self.assertEqual(probe_calls.count("local"), 3)
+        self.assertEqual(tree_calls, [])
+
+    def test_lite_unknown_health_snapshot_does_not_block_worker_request(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+
+        class UnknownHealth:
+            status = "unknown"
+
+            def snapshot(self, worker):
+                return {"worker": worker, "status": self.status, "healthy": False}
+
+            def probe_worker(self, worker):
+                return {"worker": worker, "status": self.status, "healthy": False}
+
+        health = UnknownHealth()
+        self.control.worker_health_cache = health
+        self.dispatcher.check_worker_fast = None
+        tree_calls = []
+        self.dispatcher.workspace_tree = lambda worker, path: (
+            tree_calls.append((worker, path))
+            or {"path": path, "items": [{"name": "reachable", "type": "directory"}]}
+        )
+
+        for status in ("unknown", "stale"):
+            health.status = status
+            response = self.client.get(
+                "/api/v1/utility/tree",
+                headers=headers,
+                params={"worker": "local", "path": "/workspace"},
+            )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["items"][0]["name"], "reachable")
+
+        self.assertEqual(tree_calls, [("local", "/workspace")] * 2)
+
+    def test_lite_fresh_success_overrides_one_failed_background_probe(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+
+        probe_results = iter([False, True])
+        probe_calls = []
+
+        def check_worker(worker):
+            probe_calls.append(worker)
+            return {"healthy": next(probe_results)}
+
+        health = WorkerHealthMonitor(self.workers, check_worker)
+        health.refresh_once()  # One failed background probe is only a hint.
+        self.control.worker_health_cache = health
+        tree_calls = []
+        self.dispatcher.workspace_tree = lambda worker, path: (
+            tree_calls.append((worker, path))
+            or {"path": path, "items": [{"name": "reachable", "type": "directory"}]}
+        )
+
+        response = self.client.get(
+            "/api/v1/utility/tree",
+            headers=headers,
+            params={"worker": "local", "path": "/workspace"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["items"][0]["name"], "reachable")
+        self.assertEqual(probe_calls, ["local", "local"])
+        self.assertEqual(tree_calls, [("local", "/workspace")])
+
     def test_lite_local_package_exposes_local_worker_as_explicit_target(self):
         headers = self.login(42)
         self.context.config.gateway_mode = "lite"
@@ -1133,7 +1325,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(local_target.status_code, 404, local_target.text)
 
-    def test_lite_tts_submit_uses_health_snapshot_before_capability_probe(self):
+    def test_lite_tts_submit_uses_fresh_offline_probe_before_capability_probe(self):
         self.context.config.gateway_mode = "lite"
         self.control.gateway_mode = "lite"
         self.context.config.worker_local_url = "http://worker"
@@ -1147,6 +1339,7 @@ class BackendApiTests(unittest.TestCase):
                 return {"worker": worker, "status": "offline", "healthy": False}
 
         self.control.worker_health_cache = Health()
+        self.dispatcher.check_worker_fast = lambda _worker: {"healthy": False}
         capability_calls = []
         original_capabilities = self.dispatcher.capabilities
         self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or original_capabilities(worker)
@@ -3589,6 +3782,79 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(enabled.json()["enabled"])
 
+    def test_worker_restart_uses_two_fresh_probes_and_supervisor_scoped_token(self):
+        headers = self.login(42)
+        store = SqliteWorkerRestartStore(Path(self.temp.name) / "worker-restart.sqlite3")
+        store.record_supervisor_heartbeat("local")
+        health = WorkerHealthMonitor(
+            self.workers,
+            lambda worker: {"healthy": False},
+        )
+        health.refresh_once()
+        service = WorkerRestartCoordinator(
+            store,
+            self.workers,
+            health,
+            self.jobs,
+            self.control,
+            dispatcher=self.dispatcher,
+        )
+        self.context.worker_health_monitor = health
+        self.context.worker_restart_service = service
+        self.control.worker_health_cache = health
+
+        preflight = self.client.post(
+            "/api/v1/workers/local/restart/preflight", headers=headers
+        )
+        self.assertEqual(preflight.status_code, 200, preflight.text)
+        self.assertTrue(preflight.json()["restart_available"])
+        self.assertEqual(preflight.json()["health_probe_failures"], 2)
+
+        supervisor_token = derive_supervisor_token("local", "secret")
+        denied = self.client.get(
+            "/internal/v1/worker-supervisors/local/commands/next",
+            headers={"X-Worker-Token": "secret"},
+        )
+        self.assertEqual(denied.status_code, 401)
+        command_poll = self.client.get(
+            "/internal/v1/worker-supervisors/local/commands/next",
+            headers={"X-Worker-Token": supervisor_token},
+        )
+        self.assertEqual(command_poll.status_code, 200, command_poll.text)
+        self.assertIsNone(command_poll.json()["command"])
+
+        requested = self.client.post(
+            "/api/v1/workers/local/restart", headers=headers, json={}
+        )
+        self.assertEqual(requested.status_code, 200, requested.text)
+        self.assertEqual(requested.json()["status"], "queued")
+        command_poll = self.client.get(
+            "/internal/v1/worker-supervisors/local/commands/next",
+            headers={"X-Worker-Token": supervisor_token},
+        )
+        self.assertEqual(command_poll.json()["command"]["action"], "restart_worker")
+
+    def test_confirmed_restart_cancels_active_jobs_not_in_initial_snapshot(self):
+        job = Job(
+            id="restart-race-job",
+            kind="utility",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            payload={},
+            status=JobStatus.RUNNING,
+        )
+        self.jobs.create(job)
+
+        cancelled = self.control.cancel_worker_jobs_after_restart(
+            "local", [], operation_id="restart-op"
+        )
+
+        current = self.jobs.get(job.id)
+        self.assertEqual(cancelled, [job.id])
+        self.assertEqual(current.status, JobStatus.CANCELLED)
+        self.assertEqual(current.error["code"], "WORKER_RESTARTED")
+
     def test_worker_tts_health_is_manual_authenticated_and_profile_scoped(self):
         denied = self.client.get("/api/v1/workers/local/tts/health")
         self.assertEqual(denied.status_code, 401)
@@ -5285,16 +5551,17 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(metrics["workers"][0]["quickmode_queued"], 0)
         self.assertIsNotNone(metrics["average_queue_wait_seconds"])
 
-    def test_unresponsive_worker_is_exposed_in_worker_and_job_metrics(self):
+    def test_unconfirmed_cancel_marker_does_not_mislabel_worker_as_unresponsive(self):
         headers = self.login()
 
         class Health:
             def snapshot(self, worker):
                 return {
                     "worker": worker,
-                    "status": "unresponsive",
+                    "status": "offline",
                     "healthy": False,
                     "reason": "event_backlog_cancel_unconfirmed",
+                    "cancellation_unconfirmed": True,
                 }
 
         self.context.worker_health_monitor = Health()
@@ -5312,8 +5579,8 @@ class BackendApiTests(unittest.TestCase):
             item for item in metrics_response.json()["workers"]
             if item["worker"] == "local"
         )
-        self.assertEqual(local_worker["health_status"], "unresponsive")
-        self.assertEqual(local_metrics["status"], "unresponsive")
+        self.assertEqual(local_worker["health_status"], "offline")
+        self.assertNotEqual(local_metrics["status"], "unresponsive")
 
     def test_worker_event_latency_and_phase_timing_are_scoped_to_owner_job(self):
         headers = self.login()

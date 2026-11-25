@@ -1,120 +1,118 @@
-# Restart worker dari Web: rencana
+# Restart worker dari Web
 
-**Status:** rencana disimpan untuk dilanjutkan nanti. Pengguna menyetujui
-rencana ini untuk dicatat, tetapi belum meminta spec, tiket, implementasi,
-deployment, atau restart production.
+**Status:** implementasi ada di `main`; supervisor host belum dipasang pada host
+production. Tombol Web tidak dapat me-restart Docker sampai service systemd
+supervisor terpasang dan heartbeat muncul.
 
 ## Tujuan
 
-Operator dapat meminta restart worker tertentu dari Web tanpa login ke VPS
-atau menjalankan SSH. Jalur kontrol tetap bekerja ketika API atau event loop
-worker macet.
+Status event yang terlambat atau hilang tidak boleh menahan job baru ketika
+worker masih dapat dijangkau. Jika dua probe baru memastikan worker tidak sehat
+atau tidak dapat dijangkau, operator dapat meminta restart service worker dari
+Web. Sesudah container dipastikan berhenti, job aktif yang terputus menjadi
+`cancelled` dengan hasil tidak pasti; tidak ada retry otomatis.
 
-## Fakta implementasi saat ini
+## Admission dan status event
 
-- Gateway mengirim job dan kontrol worker melalui HTTP dispatcher yang
-  terautentikasi.
-- Backend gateway dan container worker tidak memiliki Docker socket.
-- Worker Compose memakai `restart: unless-stopped`, tetapi gateway belum punya
-  perintah untuk me-restart seluruh service worker.
-- Recovery helper TTS hanya me-restart helper TTS, bukan worker.
-- Target Docker yang ada: `worker-local` pada Compose gateway, dan service
-  `worker` pada Compose masing-masing remote.
+- Probe background tiap 30 detik hanya memberi status informasi.
+- `unknown`, `stale`, keterlambatan event, dan satu probe gagal bukan bukti
+  worker mati. Gateway mencoba operasi yang diminta dan membiarkan respons
+  worker menentukan hasilnya.
+- Jika perlu memastikan health, gateway menjalankan paling banyak dua probe
+  ringan. Admission baru ditahan hanya jika kedua probe baru gagal atau worker
+  memang dinonaktifkan. Snapshot lama tidak cukup untuk mengarantina worker.
+- Job yang progress/event-nya stale tidak dibatalkan otomatis, termasuk saat
+  dua probe worker gagal. Gateway mempertahankan job dan resource lease agar
+  proses fisik tidak terlihat selesai sebelum supervisor memastikan container
+  berhenti.
+- Saat operasi restart aktif, gateway menahan admission dan dispatcher untuk
+  worker tersebut sampai supervisor melaporkan hasil terminal.
+- Worker outbox memadatkan progress lama dan milestone command lama sebelum
+  event terminal dikirim, sambil mempertahankan hasil command terbaru per
+  runtime/profile, snapshot progress/log terakhir, serta event dengan efek
+  samping katalog.
 
-## Arsitektur yang disarankan
+## Supervisor host
 
-Pasang supervisor host kecil sebagai service `systemd` pada setiap host Docker:
+Supervisor berjalan sebagai service `systemd` di host Docker. Backend/worker
+tidak menerima Docker socket. Supervisor hanya menjalankan `restart_worker`
+untuk target allowlist tetap, tanpa shell atau command yang dikirim pengguna.
+Supervisor membuat koneksi HTTPS keluar ke gateway setiap sekitar 3 detik dan
+menyimpan hasil lokal untuk deduplikasi.
 
-- VPS gateway: hanya mengelola Compose service `worker-local`.
-- VPS `remote-1`: hanya mengelola Compose service `worker`.
-- VPS `remote-2`: hanya mengelola Compose service `worker`.
-
-Mapping checkout yang diketahui saat rencana ini ditulis:
-
-| Host | Root Compose | Compose file | Service |
+| Worker | Root Compose | Compose file | Service |
 | --- | --- | --- | --- |
-| Gateway / `worker-local` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.gateway.yml` | `worker-local` |
+| `local` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.gateway.yml` | `worker-local` |
 | `remote-1` | `/www/wwwroot/downloads/bot` | `docker-compose.worker.yml` | `worker` |
 | `remote-2` | `/www/wwwroot/dockter_bot_tdl` | `docker-compose.worker.yml` | `worker` |
 
-Saat supervisor dipasang nanti, validasi project Compose aktual dari label
-container di host tersebut dan simpan mapping tetapnya dalam konfigurasi lokal
-supervisor. Jangan menebak project dari nama checkout atau memakai direktori
-repo yang kebetulan sama.
+Installer memeriksa label Compose container yang sedang ada dan menolak project,
+root, atau service yang tidak cocok. Ia membaca `WORKER_API_TOKEN` dari env file
+host tetapi menurunkan token supervisor khusus per worker dengan HMAC; token API
+worker tidak disalin ke konfigurasi supervisor. Perubahan/rotasi token worker
+mengharuskan supervisor pada host tersebut dipasang ulang.
 
-Supervisor berjalan terpisah dari container worker dan memakai koneksi HTTPS
-keluar yang terautentikasi untuk mengambil perintah dari gateway. Tidak perlu
-membuka port supervisor ke internet. Untuk gateway-local, supervisor berada di
-host yang sama tetapi tetap terpisah dari backend dan worker.
+Jalankan installer hanya dari checkout yang benar, pada host target, setelah
+Compose service worker sudah berjalan dan labelnya diverifikasi. Contoh:
 
-Supervisor hanya menerima operasi restart untuk target Compose tetap dari
-konfigurasinya. Nama project, root Compose, dan nama service tidak berasal dari
-request pengguna. Supervisor tidak menyediakan shell atau perintah Docker
-generik. Jangan memasang Docker socket ke backend atau worker. Akses Docker
-host tetap berprivilege tinggi, jadi kode supervisor harus kecil, diaudit,
-mencatat operasi, dan membatasi satu restart aktif per worker.
+```bash
+python3 tools/install_worker_supervisor.py --worker local --gateway-url https://ui.utama.naufix.space
+python3 tools/install_worker_supervisor.py --worker remote-1 --gateway-url https://ui.utama.naufix.space
+python3 tools/install_worker_supervisor.py --worker remote-2 --gateway-url https://ui.utama.naufix.space
+```
+
+Perintah tersebut memerlukan root dan mengaktifkan unit
+`tme3bot-worker-supervisor@<worker>.service`. Jangan menjalankan installer
+untuk worker yang tidak tersedia pada host. Instalasi production belum
+dilakukan.
 
 ## Alur operator
 
-1. Halaman Workers menampilkan aksi **Restart worker**. Aksi tetap tersedia
-   saat Worker API tidak merespons, selama supervisor host masih terhubung.
-2. Konfirmasi menunjukkan worker terpilih dan jumlah job aktif yang akan
-   terputus. Hanya satu operasi restart per worker boleh berjalan pada satu
-   waktu; operasi duplikat menggunakan ID idempotensi yang sama.
-3. Gateway mencatat operasi restart, menahan dispatch baru untuk worker itu,
-   lalu mengantrikan perintah bagi supervisor yang terikat ke worker tersebut.
-   Status restart memakai state terpisah; jangan mengubah `enabled` worker,
-   karena `enabled` adalah kontrol admission permanen operator.
-4. Supervisor mengambil perintah, memeriksa target allowlist, lalu menjalankan
-   restart Compose hanya pada service worker yang ditetapkan. Helper TTS,
-   Aria2, Redis, dan service lain tidak ikut direstart.
-5. Supervisor melaporkan hasil tindakan. Gateway memeriksa kembali health
-   worker sebelum melepas penahanan dispatch.
-6. UI menampilkan status `diminta`, `sedang restart`, `siap`, atau `gagal`,
-   beserta alasan aman bila supervisor tidak dapat dijangkau.
+1. Tombol **Restart worker** menjalankan preflight baru; status UI atau event
+   latency saja tidak memulai restart.
+2. Konfirmasi muncul hanya setelah dua probe gagal dan heartbeat supervisor
+   masih segar. Dialog menunjukkan jumlah job aktif yang terdampak.
+3. Gateway membuat satu operasi idempoten per worker. Selama operasi queued atau
+   restarting, job baru dan dispatch tertahan untuk worker itu.
+4. Supervisor validasi ulang label Docker, menghentikan lalu memulai kembali
+   hanya service worker tetap. Aria2, TTS, Redis, dan backend tidak ikut
+   direstart.
+5. Jika worker tidak merespons karena request lambat namun akhirnya merespons,
+   gateway tidak menandai worker mati hanya dari event delay. Probe health
+   terpisah yang memutuskan apakah restart tersedia.
 
 ## Dampak job
 
-Sebelum perintah dijalankan, gateway mengambil daftar job nonterminal yang
-terikat ke worker. Setelah supervisor mengonfirmasi container worker benar-benar
-direstart, job yang terputus ditandai `cancelled` dengan hasil tidak pasti
-karena efek eksternal mungkin sudah terjadi. Bila restart gagal sebelum worker
-berhenti, job tidak diterminalkan oleh operasi restart. Job tidak dilanjutkan
-atau di-retry otomatis setelah restart. Retry tetap manual dan hanya tersedia
-untuk jenis job yang sudah mendukung retry.
-
-Event terlambat dari worker yang baru hidup tidak boleh menghidupkan kembali
-job terminal. Simpan sebagai hasil terlambat untuk rekonsiliasi/audit bila
-kontrak job mendukungnya. Worker tetap dikarantina bila restart berhasil tetapi
-health check belum pulih; lepaskan karantina hanya setelah worker sehat.
+Saat konfirmasi restart dibuat, gateway menyimpan ID job aktif sebagai bukti.
+Setelah Docker memastikan worker berhenti, gateway juga mengambil ulang seluruh
+job nonterminal untuk worker tersebut agar job yang berlomba masuk selama
+preflight tidak tertinggal. Job itu ditandai `cancelled` dengan
+`WORKER_RESTARTED`, `outcome_uncertain=true`, dan
+`reconciliation_required=true`. Event lama tidak boleh menghidupkan kembali
+status terminal. Jika stop gagal dan container masih hidup, job tidak dibatalkan.
+Retry tetap manual.
 
 ## Keamanan dan kegagalan
 
-- Gunakan kredensial supervisor terpisah per host, autentikasi TLS, masa berlaku
-  perintah, ID idempotensi, dan audit tanpa mencatat rahasia.
-- Supervisor menolak target yang tidak ada di konfigurasi tetapnya dan
-  membatasi frekuensi restart.
-- Bila supervisor offline, UI menyatakan perintah tidak terkirim; gateway tidak
-  mengklaim worker sudah direstart.
-- Bila VPS atau Docker daemon host mati, supervisor tidak bisa menjalankan
-  restart. Kondisi itu tetap memerlukan pemulihan host di luar aplikasi.
-- Jangan membuat retry job otomatis sebagai bagian dari restart.
+- Endpoint supervisor hanya menerima token turunan khusus yang dibandingkan
+  secara constant-time; endpoint tetap memakai HTTPS.
+- Target Compose, path dan nama service ditetapkan di kode allowlist dan
+  diperiksa lagi terhadap label Docker.
+- Hanya ada satu operasi restart aktif per worker dan ada batas frekuensi
+  restart di supervisor.
+- Jika supervisor offline, tombol menjelaskan bahwa restart tidak dapat
+  dikirim. Gateway tidak mengaku worker sudah direstart.
+- Jika host atau daemon Docker mati, pemulihan host tetap memerlukan akses
+  infrastruktur di luar aplikasi.
 
-## Verifikasi yang direncanakan untuk tahap implementasi
+## Verifikasi
 
-- Tes supervisor memakai adapter Docker palsu: target allowlist, penolakan
-  target bebas, idempotensi, batas frekuensi, dan status hasil.
-- Tes gateway dengan supervisor palsu: otorisasi operator, satu operasi aktif
-  per worker, antrean/ack, timeout supervisor, job terdampak, dan tidak ada
-  retry otomatis.
-- Tes UI dengan API mock: restart saat worker sehat maupun tidak merespons,
-  konfirmasi dampak job, status operasi, serta pesan saat supervisor offline.
-- Uji staging satu worker lebih dahulu. Lanjutkan ke host lain setelah restart
-  dan health check terverifikasi.
-
-## Batas rencana
-
-Dokumen ini mencatat arsitektur yang disarankan untuk kelanjutan. Dokumen ini
-bukan tiket atau izin untuk membuat tiket, mengubah source, memasang supervisor,
-menjalankan restart, atau deploy. Tunggu permintaan lanjutan pengguna sebelum
-memasuki tahap tersebut.
+- Unit/integrasi lokal menguji bounded health probes, admission saat snapshot
+  stale, pemadatan outbox, fence operasi restart, pembatalan job setelah stop,
+  autentikasi supervisor, crash recovery, idempotensi, allowlist Docker, dan
+  batas frekuensi.
+- UI diuji dengan API mock untuk memastikan restart hanya dapat dikonfirmasi
+  sesudah preflight yang valid dan status operasi dapat diikuti.
+- Setelah CI dan review lulus, pasang supervisor di satu host staging terlebih
+  dahulu; uji health dan restart sebelum memasangnya di host lain. Jangan
+  menguji restart pada production tanpa permintaan eksplisit.

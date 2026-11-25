@@ -838,15 +838,10 @@ class WorkerCommandStoreTests(unittest.TestCase):
                 (terminal_sequence, "cancelled"),
             ],
         )
-        with sqlite3.connect(self.path) as db:
-            superseded = db.execute(
-                "SELECT COUNT(*) FROM worker_event_outbox WHERE job_id=? AND status='superseded'",
-                (job_id,),
-            ).fetchone()[0]
-        self.assertEqual(superseded, 80)
+        self.assertEqual(len(delivered), 4)
 
-    def test_cancel_request_supersedes_telemetry_but_preserves_side_effects(self):
-        job_id = "cancel-request-with-event-backlog"
+    def test_failed_terminal_event_supersedes_old_command_milestones(self):
+        job_id = "failed-utility-with-event-backlog"
         for index in range(80):
             self.store.append_event(
                 job_id,
@@ -857,6 +852,218 @@ class WorkerCommandStoreTests(unittest.TestCase):
                 },
                 transient=False,
             )
+        side_effect_sequence = self.store.append_event(
+            job_id,
+            {
+                "event_type": "storage.item_uploaded",
+                "status": "running",
+                "result": {"item": {"original_name": "already-uploaded.bin"}},
+            },
+            transient=False,
+        )
+        progress_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 7}},
+            transient=True,
+        )
+        log_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "log.snapshot", "status": "running", "progress": {"log_tail": "last output"}},
+            transient=False,
+        )
+        terminal_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "utility.completed", "status": "failed", "error": {"code": "UTILITY_FAILED"}},
+            transient=False,
+        )
+
+        delivered = []
+        while (claimed := self.store.claim_event()) is not None:
+            delivered.append((claimed[2], claimed[3]["event_type"]))
+            self.assertTrue(
+                self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertEqual(
+            delivered,
+            [
+                (side_effect_sequence, "storage.item_uploaded"),
+                (progress_sequence, "progress.snapshot"),
+                (log_sequence, "log.snapshot"),
+                (terminal_sequence, "utility.completed"),
+            ],
+        )
+        self.assertEqual(len(delivered), 4)
+
+    def test_terminal_compaction_preserves_latest_command_result_per_runtime_profile(self):
+        job_id = "terminal-command-results"
+        latest_upload_result = None
+        for index in range(80):
+            latest_upload_result = self.store.append_event(
+                job_id,
+                {
+                    "event_type": "command.completed",
+                    "status": "running",
+                    "result": {
+                        "runtime": "upload",
+                        "profile": "ruth2",
+                        "returncode": 1 if index < 79 else 0,
+                        "output_tail": [f"result-{index}"],
+                    },
+                },
+                transient=False,
+            )
+        export_result = self.store.append_event(
+            job_id,
+            {
+                "event_type": "command.completed",
+                "status": "running",
+                "result": {
+                    "runtime": "export",
+                    "profile": "default",
+                    "returncode": 0,
+                },
+            },
+            transient=False,
+        )
+        upload_result = self.store.append_event(
+            job_id,
+            {
+                "event_type": "command.completed",
+                "status": "running",
+                "result": {
+                    "runtime": "upload",
+                    "profile": "irang",
+                    "returncode": 0,
+                },
+            },
+            transient=False,
+        )
+        progress_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 9}},
+            transient=True,
+        )
+        terminal_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "utility.completed", "status": "failed"},
+            transient=False,
+        )
+
+        delivered = []
+        while (claimed := self.store.claim_event()) is not None:
+            payload = claimed[3]
+            result = payload.get("result") or {}
+            delivered.append((
+                claimed[2],
+                payload["event_type"],
+                result.get("runtime"),
+                result.get("profile"),
+                (result.get("output_tail") or [None])[0],
+            ))
+            self.assertTrue(
+                self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertEqual(
+            delivered,
+            [
+                (latest_upload_result, "command.completed", "upload", "ruth2", "result-79"),
+                (export_result, "command.completed", "export", "default", None),
+                (upload_result, "command.completed", "upload", "irang", None),
+                (progress_sequence, "progress.snapshot", None, None, None),
+                (terminal_sequence, "utility.completed", None, None, None),
+            ],
+        )
+
+    def test_startup_compacts_legacy_backlog_before_pending_failed_terminal(self):
+        legacy_path = Path(self.temp.name) / "legacy-terminal-backlog.sqlite3"
+        legacy_store = WorkerCommandStore(legacy_path)
+        job_id = "legacy-failed-utility"
+        for index in range(8):
+            legacy_store.append_event(
+                job_id,
+                {"event_type": "command.completed", "status": "running", "command_index": index},
+                transient=False,
+            )
+        side_effect_sequence = legacy_store.append_event(
+            job_id,
+            {"event_type": "storage.item_uploaded", "status": "running"},
+            transient=False,
+        )
+        progress_sequence = legacy_store.append_event(
+            job_id,
+            {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 7}},
+            transient=True,
+        )
+        log_sequence = legacy_store.append_event(
+            job_id,
+            {"event_type": "log.snapshot", "status": "running", "progress": {"log_tail": "last output"}},
+            transient=False,
+        )
+        terminal_sequence = legacy_store.append_event(
+            job_id,
+            {"event_type": "utility.completed", "status": "failed"},
+            transient=False,
+        )
+
+        # Recreate the stuck rows written by the old implementation, where
+        # failed terminal events did not compact command telemetry.
+        with sqlite3.connect(legacy_path) as db:
+            db.execute(
+                "UPDATE worker_event_outbox SET status='pending',last_error=NULL "
+                "WHERE job_id=? AND status='superseded'",
+                (job_id,),
+            )
+
+        recovered = WorkerCommandStore(legacy_path)
+        delivered = []
+        while (claimed := recovered.claim_event()) is not None:
+            delivered.append((claimed[2], claimed[3]["event_type"]))
+            self.assertTrue(
+                recovered.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertEqual(
+            delivered,
+            [
+                (side_effect_sequence, "storage.item_uploaded"),
+                (progress_sequence, "progress.snapshot"),
+                (log_sequence, "log.snapshot"),
+                (terminal_sequence, "utility.completed"),
+            ],
+        )
+
+    def test_cancel_request_supersedes_telemetry_but_preserves_side_effects(self):
+        job_id = "cancel-request-with-event-backlog"
+        for index in range(80):
+            self.store.append_event(
+                job_id,
+                {
+                    "event_type": "command.completed",
+                    "status": "running",
+                    "command_index": index,
+                    "result": {
+                        "runtime": "upload",
+                        "profile": "ruth2",
+                        "returncode": index,
+                    },
+                },
+                transient=False,
+            )
+        latest_command_sequence = self.store.append_event(
+            job_id,
+            {
+                "event_type": "command.completed",
+                "status": "running",
+                "result": {
+                    "runtime": "upload",
+                    "profile": "ruth2",
+                    "returncode": 0,
+                },
+            },
+            transient=False,
+        )
         side_effect_sequence = self.store.append_event(
             job_id,
             {
@@ -901,20 +1108,23 @@ class WorkerCommandStoreTests(unittest.TestCase):
                 self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
             )
 
-        self.assertEqual(
-            delivered,
+        self.assertCountEqual(
+            [(item[0], item[2]) for item in delivered],
             [
-                (job_id, side_effect_sequence, "storage.item_uploaded"),
-                (job_id, cancel_sequence, "cancel.requested"),
-                ("unrelated-job", other_job_sequence, "progress"),
+                (job_id, "storage.item_uploaded"),
+                (job_id, "command.completed"),
+                (job_id, "cancel.requested"),
+                ("unrelated-job", "progress"),
             ],
         )
-        with sqlite3.connect(self.path) as db:
-            superseded = db.execute(
-                "SELECT COUNT(*) FROM worker_event_outbox WHERE job_id=? AND status='superseded'",
-                (job_id,),
-            ).fetchone()[0]
-        self.assertEqual(superseded, 82)
+        command_result = next(
+            item for item in delivered if item[2] == "command.completed"
+        )
+        self.assertEqual(command_result[1], latest_command_sequence)
+        self.assertLess(
+            next(index for index, item in enumerate(delivered) if item[2] == "command.completed"),
+            next(index for index, item in enumerate(delivered) if item[2] == "cancel.requested"),
+        )
         self.assertLess(progress_sequence, cancel_sequence)
         self.assertLess(log_sequence, cancel_sequence)
         self.assertFalse(

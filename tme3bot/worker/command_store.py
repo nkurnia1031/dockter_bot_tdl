@@ -18,6 +18,7 @@ from tme3bot.domain.models import DomainError
 
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "needs_reconciliation"})
+_TERMINAL_STATUSES_SQL = ",".join(f"'{status}'" for status in sorted(TERMINAL_STATUSES))
 _ALLOWED_COMMAND_STATUSES = frozenset(
     {"accepted", "claimed", "queued", "running", "cancelling", *TERMINAL_STATUSES}
 )
@@ -212,6 +213,7 @@ class WorkerCommandStore:
                 "ON worker_event_outbox(job_id,sequence) "
                 "WHERE status IN ('pending','sending')"
             )
+            self._compact_pending_terminal_event_backlogs(db)
             upload_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(worker_storage_upload_items)").fetchall()
@@ -221,6 +223,101 @@ class WorkerCommandStore:
                     "ALTER TABLE worker_storage_upload_items "
                     "ADD COLUMN caption TEXT NOT NULL DEFAULT ''"
                 )
+
+    @staticmethod
+    def _supersede_telemetry_before_terminal(
+        db: sqlite3.Connection, job_id: str, sequence: int, *, reason: str,
+        keep_latest_snapshots: bool = True,
+    ) -> None:
+        latest_progress = latest_log = None
+        latest_result_ids: set[int] = set()
+        if keep_latest_snapshots:
+            latest_progress = db.execute(
+                "SELECT id FROM worker_event_outbox "
+                "WHERE job_id=? AND sequence<? AND transient=1 "
+                "AND status IN ('pending','sending') ORDER BY sequence DESC LIMIT 1",
+                (str(job_id), int(sequence)),
+            ).fetchone()
+            latest_log = db.execute(
+                "SELECT id FROM worker_event_outbox "
+                "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                "AND json_extract(event_json,'$.event_type')='log.snapshot' "
+                "ORDER BY sequence DESC LIMIT 1",
+                (str(job_id), int(sequence)),
+            ).fetchone()
+        # command.completed carries actual TDL/rclone success evidence that
+        # the gateway uses to update readiness. Preserve the latest result per
+        # execution lane even when a cancel request drops progress snapshots.
+        result_rows = db.execute(
+            "SELECT id,event_json FROM worker_event_outbox "
+            "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+            "AND json_extract(event_json,'$.event_type')='command.completed' "
+            "ORDER BY sequence DESC",
+            (str(job_id), int(sequence)),
+        ).fetchall()
+        seen_result_lanes: set[tuple[str, str]] = set()
+        for result_row in result_rows:
+            try:
+                payload = json.loads(result_row["event_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if not isinstance(result, dict):
+                continue
+            runtime = str(result.get("runtime") or "").strip().lower()
+            profile = str(result.get("profile") or "").strip().lower()
+            if not runtime:
+                continue
+            lane = (runtime, profile)
+            if lane in seen_result_lanes:
+                continue
+            seen_result_lanes.add(lane)
+            latest_result_ids.add(int(result_row["id"]))
+        keep_ids = {
+            int(row[0]) for row in (latest_progress, latest_log) if row is not None
+        }
+        keep_ids.update(latest_result_ids)
+        telemetry = _event_telemetry_predicate()
+        if keep_ids:
+            placeholders = ",".join("?" for _ in keep_ids)
+            db.execute(
+                "UPDATE worker_event_outbox SET status='superseded',"
+                "lease_token=NULL,lease_until=NULL,last_error=? "
+                f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                f"AND {telemetry} AND id NOT IN ({placeholders})",
+                (reason, str(job_id), int(sequence), *sorted(keep_ids)),
+            )
+        else:
+            db.execute(
+                "UPDATE worker_event_outbox SET status='superseded',"
+                "lease_token=NULL,lease_until=NULL,last_error=? "
+                f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                f"AND {telemetry}",
+                (reason, str(job_id), int(sequence)),
+            )
+
+    def _compact_pending_terminal_event_backlogs(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """Repair terminal events persisted before telemetry was coalesced."""
+        terminal_rows = db.execute(
+            "SELECT job_id,sequence,json_extract(event_json,'$.event_type') AS event_type "
+            "FROM worker_event_outbox e "
+            "WHERE status IN ('pending','sending') AND ("
+            "json_extract(event_json,'$.event_type')='cancel.requested' OR "
+            f"json_extract(event_json,'$.status') IN ({_TERMINAL_STATUSES_SQL})) "
+            "ORDER BY id"
+        ).fetchall()
+        for row in terminal_rows:
+            self._supersede_telemetry_before_terminal(
+                db,
+                str(row["job_id"]),
+                int(row["sequence"]),
+                reason="terminal_event_superseded",
+                keep_latest_snapshots=(
+                    str(row["event_type"] or "").strip().lower() != "cancel.requested"
+                ),
+            )
 
     @staticmethod
     def _validate_envelope(envelope: Any) -> tuple[str, str | None, str | None, int, str]:
@@ -1185,55 +1282,26 @@ class WorkerCommandStore:
             row = db.execute("SELECT last_sequence FROM worker_event_sequences WHERE job_id=?", (str(job_id),)).fetchone()
             sequence = int(row["last_sequence"]) + 1 if row else 2
             event_type = str(payload.get("event_type") or "").strip().lower()
+            terminal_status = str(payload.get("status") or "").strip().lower()
             cancellation_priority = (
                 event_type == "cancel.requested"
-                or str(payload.get("status") or "").lower() == "cancelled"
+                or terminal_status in TERMINAL_STATUSES
             )
             if cancellation_priority:
                 # Drop telemetry backlog so stop control can advance, while
                 # retaining non-telemetry events that carry catalog or other
                 # durable side effects.
-                keep_ids: set[int] = set()
-                if event_type != "cancel.requested":
-                    latest_progress = db.execute(
-                        "SELECT id FROM worker_event_outbox "
-                        "WHERE job_id=? AND sequence<? AND transient=1 "
-                        "AND status IN ('pending','sending') ORDER BY sequence DESC LIMIT 1",
-                        (str(job_id), sequence),
-                    ).fetchone()
-                    if latest_progress is not None:
-                        keep_ids.add(int(latest_progress["id"]))
-                    latest_log = db.execute(
-                        "SELECT id FROM worker_event_outbox "
-                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
-                        "AND json_extract(event_json,'$.event_type')='log.snapshot' "
-                        "ORDER BY sequence DESC LIMIT 1",
-                        (str(job_id), sequence),
-                    ).fetchone()
-                    if latest_log is not None:
-                        keep_ids.add(int(latest_log["id"]))
-                reason = (
-                    "cancel_request_superseded"
-                    if event_type == "cancel.requested"
-                    else "terminal_event_superseded"
+                self._supersede_telemetry_before_terminal(
+                    db,
+                    str(job_id),
+                    sequence,
+                    reason=(
+                        "cancel_request_superseded"
+                        if event_type == "cancel.requested"
+                        else "terminal_event_superseded"
+                    ),
+                    keep_latest_snapshots=event_type != "cancel.requested",
                 )
-                telemetry = _event_telemetry_predicate()
-                if keep_ids:
-                    placeholders = ",".join("?" for _ in keep_ids)
-                    db.execute(
-                        "UPDATE worker_event_outbox SET status='superseded',"
-                        "lease_token=NULL,lease_until=NULL,last_error=? "
-                        f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') AND {telemetry} "
-                        f"AND id NOT IN ({placeholders})",
-                        (reason, str(job_id), sequence, *sorted(keep_ids)),
-                    )
-                else:
-                    db.execute(
-                        "UPDATE worker_event_outbox SET status='superseded',"
-                        f"lease_token=NULL,lease_until=NULL,last_error=? "
-                        f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') AND {telemetry}",
-                        (reason, str(job_id), sequence),
-                    )
             db.execute(
                 "INSERT INTO worker_event_sequences(job_id,last_sequence) VALUES (?,?) ON CONFLICT(job_id) DO UPDATE SET last_sequence=excluded.last_sequence",
                 (str(job_id), sequence),
@@ -1322,9 +1390,12 @@ class WorkerCommandStore:
                 "OR json_extract(c.event_json,'$.status')='cancelled') "
                 f"AND NOT {_event_telemetry_predicate('e')})"
             )
-            cancellation_priority = f"({cancellation_event} OR {semantic_cancel_predecessor})"
-            # Stop control traffic outranks other jobs. Required side-effect
-            # events ahead of it are promoted too and remain sequence-ordered.
+            cancellation_priority = (
+                f"({cancellation_event} OR {semantic_cancel_predecessor})"
+            )
+            # Stop control traffic outranks unrelated jobs. Ordinary terminal
+            # events use the regular fair scheduler after their own telemetry
+            # backlog has been compacted.
             row = db.execute(
                 f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
                 f"WHERE {eligible} AND {cancellation_priority} ORDER BY e.id LIMIT 1",
