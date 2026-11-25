@@ -455,7 +455,7 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertEqual(self.jobs.count(), 0)
         self.assertEqual(self.dispatcher.commands, [])
 
-    def test_lite_rejects_unknown_offline_or_stale_worker_health_without_probing(self):
+    def test_lite_allows_job_queueing_when_health_snapshot_is_not_confirmed_offline(self):
         class Health:
             def __init__(self, status):
                 self.status = status
@@ -465,17 +465,13 @@ class DurableDispatchTests(unittest.TestCase):
                 return {"worker": worker, "status": self.status, "healthy": False}
 
         self.control.gateway_mode = "lite"
-        for status, expected in (
-            ("unknown", "WORKER_HEALTH_UNKNOWN"),
-            ("stale", "WORKER_HEALTH_STALE"),
-            ("offline", "WORKER_OFFLINE"),
-        ):
+        for status in ("unknown", "stale", "offline"):
             with self.subTest(status=status):
                 health = Health(status)
                 self.control.worker_health_cache = health
-                with self.assertRaises(DomainError) as raised:
-                    self.submit("export", worker="remote-2")
-                self.assertEqual(raised.exception.code, expected)
+                operation = self.submit("export", worker="remote-2")
+                self.assertEqual(operation.status.value, "queued")
+                self.assertEqual(self.jobs.get(operation.job_id).worker, "remote-2")
                 self.assertEqual(health.probes, 0)
                 self.assertEqual(self.dispatcher.commands, [])
 
