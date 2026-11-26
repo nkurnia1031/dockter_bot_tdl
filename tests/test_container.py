@@ -56,6 +56,7 @@ class ContainerBuildTests(unittest.TestCase):
         )
         self.assertIn("downloads.rclone.org/v${RCLONE_VERSION}/${deb_name}", basefile)
         self.assertIn("sha256sum -c -", basefile)
+        self.assertIn("env -u RCLONE_VERSION rclone version", basefile)
         self.assertNotIn("        rclone \\\n", basefile)
         self.assertIn("FROM --platform=${BUILDPLATFORM}", basefile)
         self.assertIn("RUN go mod download", basefile)

@@ -54,7 +54,7 @@ RUN set -eu; \
     test -n "${expected}"; \
     printf '%s  %s\n' "${expected}" /tmp/rclone.deb | sha256sum -c -; \
     dpkg -i /tmp/rclone.deb; \
-    rclone version; \
+    env -u RCLONE_VERSION rclone version; \
     rm -f /tmp/rclone.deb
 
 USER root
