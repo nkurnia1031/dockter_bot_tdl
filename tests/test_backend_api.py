@@ -6099,14 +6099,14 @@ class BackendApiTests(unittest.TestCase):
                 "folder_path": "/workspace/biasa",
                 "worker": "local",
                 "provider": "rclone",
-                "rclone_path": "archive/2026",
+                "rclone_path": r"archive:2026\backup",
                 "transfer_mode": "copy",
             },
         )
         self.assertEqual(created.status_code, 200)
         command = self.dispatcher.commands[-1][1]
         self.assertEqual(command["payload"]["provider"], "rclone")
-        self.assertEqual(command["payload"]["rclone_path"], "archive/2026")
+        self.assertEqual(command["payload"]["rclone_path"], r"archive:2026\backup")
         self.assertEqual(
             command["payload"]["rclone_destination"], "googledrive:backup"
         )
@@ -6348,6 +6348,15 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.rclone_browse_calls[1][0:2], ("local", "remote:archive"))
         self.assertEqual(self.dispatcher.rclone_browse_calls[1][2]["path"], "docs")
         self.assertEqual(self.dispatcher.rclone_browse_calls[1][2]["offset"], 50)
+        special_name = self.client.get(
+            "/api/v1/storage/rclone/browser?worker=local&path=colon%3Asegment%5Cpart",
+            headers=headers,
+        )
+        self.assertEqual(special_name.status_code, 200, special_name.text)
+        self.assertEqual(
+            self.dispatcher.rclone_browse_calls[2][2]["path"],
+            r"colon:segment\part",
+        )
         traversal = self.client.get(
             "/api/v1/storage/rclone/browser?worker=local&path=..%2Foutside", headers=headers,
         )
@@ -6356,7 +6365,7 @@ class BackendApiTests(unittest.TestCase):
             "/api/v1/storage/rclone/browser?worker=local&path=%2Foutside", headers=headers,
         )
         self.assertEqual(absolute.status_code, 422)
-        self.assertEqual(len(self.dispatcher.rclone_browse_calls), 2)
+        self.assertEqual(len(self.dispatcher.rclone_browse_calls), 3)
 
     def test_rclone_folder_summary_uses_saved_worker_readiness_and_one_dispatch(self):
         headers = self.login()
@@ -6392,10 +6401,10 @@ class BackendApiTests(unittest.TestCase):
         created = self.client.post(
             "/api/v1/storage/rclone/actions",
             headers=headers,
-            json={"worker":"local","action":"create_folder","path":"docs","name":"2026"},
+            json={"worker":"local","action":"create_folder","path":"docs","name":r"2026:Q1\raw"},
         )
         self.assertEqual(created.status_code, 200, created.text)
-        self.assertEqual(created.json()["path"], "docs/2026")
+        self.assertEqual(created.json()["path"], r"docs/2026:Q1\raw")
         renamed = self.client.post(
             "/api/v1/storage/rclone/actions",
             headers=headers,
@@ -6405,7 +6414,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             self.dispatcher.rclone_mutation_calls,
             [
-                ("local","remote:archive","create_folder","docs","2026"),
+                ("local","remote:archive","create_folder","docs",r"2026:Q1\raw"),
                 ("local","remote:archive","rename","docs/report.txt","report-old.txt"),
             ],
         )

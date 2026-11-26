@@ -13,13 +13,13 @@ import uuid
 def register_storage(app, context, *, _active_storage_item, _deliver_storage_telegram, _model_dict, _require_storage_folders_idle, _storage_item, current_actor, job_dict, require_service):
 
     def _rclone_relative_path(path: str) -> str:
-        normalized = str(path or "").replace("\\", "/").strip("/")
+        normalized = str(path or "").strip("/")
         parts = normalized.split("/") if normalized else []
         if (
             len(normalized) > 2048
             or any(ord(char) < 32 for char in normalized)
-            or str(path or "").startswith(("/", "\\"))
-            or any(not part or part in {".", ".."} or ":" in part for part in parts)
+            or str(path or "").startswith("/")
+            or any(not part or part in {".", ".."} for part in parts)
         ):
             raise DomainError(
                 "RCLONE_BROWSER_PATH_INVALID",
@@ -29,12 +29,12 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         return normalized
 
     def _rclone_entry_name(name: str) -> str:
-        normalized = str(name or "").strip()
+        normalized = str(name or "")
         if (
             not normalized
             or len(normalized) > 120
             or normalized in {".", ".."}
-            or any(char in normalized for char in ("/", "\\", ":"))
+            or "/" in normalized
             or any(ord(char) < 32 for char in normalized)
         ):
             raise DomainError(
@@ -472,10 +472,11 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         if provider == "rclone":
             if payload.get("destination_folder_id") is not None or payload.get("folder"):
                 raise DomainError("STORAGE_TARGET_INVALID", "Pilih tepat satu tujuan upload.", status_code=422)
-            remote_path = str(payload.get("rclone_path") or "").replace("\\", "/").strip("/")
+            raw_remote_path = str(payload.get("rclone_path") or "")
+            remote_path = raw_remote_path.strip("/")
             parts = remote_path.split("/") if remote_path else []
-            if len(remote_path) > 2048 or any(ord(char) < 32 for char in remote_path) or str(payload.get("rclone_path") or "").startswith(("/", "\\")) or any(
-                not part or part in {".", ".."} or ":" in part for part in parts
+            if len(remote_path) > 2048 or "\0" in remote_path or raw_remote_path.startswith("/") or any(
+                not part or part in {".", ".."} for part in parts
             ):
                 raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
             payload["rclone_path"] = remote_path

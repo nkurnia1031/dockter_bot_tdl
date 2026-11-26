@@ -683,6 +683,7 @@ class RcloneRunnerTests(unittest.TestCase):
                     {"Path": "Projects/2026", "Name": "2026", "IsDir": True},
                     {"Path": "Projects/2026/plan.pdf", "Name": "plan.pdf", "IsDir": False, "Size": 5},
                     {"Path": "Projects/unknown.bin", "Name": "unknown.bin", "IsDir": False},
+                    {"Path": r"Folder:part\name/child.bin", "Name": "child.bin", "IsDir": False, "Size": 7},
                     {"Path": "Empty", "Name": "Empty", "IsDir": True},
                     {"Path": "loose.txt", "Name": "loose.txt", "IsDir": False, "Size": 99},
                 ]), stderr="")
@@ -700,6 +701,7 @@ class RcloneRunnerTests(unittest.TestCase):
         self.assertEqual(result["path"], "")
         self.assertEqual(result["summaries"], [
             {"path": "Empty", "file_count": 0, "folder_count": 0, "size_bytes": 0, "size_complete": True},
+            {"path": r"Folder:part\name", "file_count": 1, "folder_count": 0, "size_bytes": 7, "size_complete": True},
             {"path": "Projects", "file_count": 3, "folder_count": 1, "size_bytes": 15, "size_complete": False},
         ])
         self.assertEqual(len(fake.commands), 1)
@@ -746,7 +748,10 @@ class RcloneRunnerTests(unittest.TestCase):
         self.assertEqual(progress, [{
             "name": "nested/archive.zip", "bytes_current": 42,
             "bytes_total": 100, "speed_bps": 21, "eta_seconds": 3,
-            "percent": 42.0, "index": 1, "total": 1,
+            "percent": 42.0, "batch_bytes_current": 42,
+            "batch_speed_bps": 21, "batch_eta_seconds": 3,
+            "batch_transfers_complete": 0,
+            "index": 1, "total": 1,
         }])
         self.assertEqual(log_lines, [])
         command, kwargs = fake.commands[0]
@@ -920,6 +925,31 @@ class RcloneRunnerTests(unittest.TestCase):
             self.assertEqual(command[1:4], ["lsjson", "remote:backup/team", "--max-depth"])
             self.assertFalse(any(part in {"copy", "copyto", "mkdir", "move", "delete"} for part in command))
 
+    def test_list_directory_preserves_colon_and_backslash_in_remote_names(self):
+        class ListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Name": r"colon:name\part.bin", "IsDir": False, "Size": 8},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = ListingRunner()
+            with (
+                patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"),
+                patch.object(RcloneRunner, "_remote_backend_type", return_value="drive"),
+            ):
+                result = RcloneRunner(fake).list_directory(
+                    "remote:backup", "", config, config_root=root,
+                )
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["name"], r"colon:name\part.bin")
+        self.assertEqual(result["items"][0]["path"], r"colon:name\part.bin")
+
     def test_list_directory_rejects_traversal_before_remote_access(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -950,7 +980,67 @@ class RcloneRunnerTests(unittest.TestCase):
                     )
             self.assertEqual(fake.commands, [])
 
-    def test_storage_verification_checks_directory_roots_with_exact_raw_file_filter(self):
+    def test_remote_path_preserves_colon_and_backslash_and_rejects_traversal(self):
+        remote, relative = RcloneRunner._remote_path(
+            "remote:backup", "folder:name\\part",
+        )
+        self.assertEqual(
+            (remote, relative),
+            ("remote:backup/folder:name\\part", "folder:name\\part"),
+        )
+        with self.assertRaises(RcloneError):
+            RcloneRunner._remote_path("remote:backup", "../outside.bin")
+        self.assertEqual(RcloneRunner._remote_entry_name(r"colon:name\part"), r"colon:name\part")
+
+    def test_storage_copy_records_only_rclone_confirmed_new_objects(self):
+        class CopyLogRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                output = kwargs["output_callback"]
+                output(json.dumps({
+                    "level": "info", "msg": "Copied (new) to: file.bin",
+                    "object": "file.bin",
+                }))
+                output(json.dumps({
+                    "level": "info", "msg": "Copied (new) to: concurrent.bin",
+                    "object": "concurrent.bin",
+                }))
+                output(json.dumps({
+                    "level": "info", "msg": "Copied (new) to: colon:name\\part.bin",
+                    "object": r"colon:name\part.bin",
+                }))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            (source / "file.bin").write_bytes(b"payload")
+            (source / r"colon:name\part.bin").write_bytes(b"special-name")
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            files_from0 = root / "files-from0.bin"
+            files_from0.write_bytes(b"file.bin\0colon:name\\part.bin\0")
+            fake = CopyLogRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                copied = RcloneRunner(fake).copy_folder(
+                    source,
+                    "remote:backup",
+                    config,
+                    workspace_root=root,
+                    config_root=root,
+                    files_from0=files_from0,
+                    expected_paths=["file.bin", r"colon:name\part.bin"],
+                )
+
+        self.assertEqual(copied, {"file.bin", r"colon:name\part.bin"})
+        command = fake.commands[0][0]
+        self.assertEqual(command[1:4], ["copy", str(source), "remote:backup"])
+        self.assertIn("--ignore-existing", command)
+        self.assertIn("--files-from0", command)
+        self.assertEqual(command[command.index("--log-level") + 1], "INFO")
+
+    def test_storage_verification_uses_one_name_size_check_for_exact_file_list(self):
         class FileListRunner(FakeSubprocessRunner):
             def __init__(self):
                 super().__init__()
@@ -958,39 +1048,60 @@ class RcloneRunnerTests(unittest.TestCase):
 
             def run(self, command, **kwargs):
                 self.commands.append((command, kwargs))
-                list_path = Path(command[command.index("--files-from-raw") + 1])
-                self.file_lists.append((list_path, list_path.read_text(encoding="utf-8")))
+                list_path = Path(command[command.index("--files-from0") + 1])
+                self.file_lists.append((list_path, list_path.read_bytes()))
+                Path(command[command.index("--combined") + 1]).write_text(
+                    "= nested/Latin.7z.001\n"
+                    "= nested/YouKnoWhat?.7z.001\n"
+                    "= nested/colon:name\\part.bin\n",
+                    encoding="utf-8",
+                )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = root / "rclone.conf"
             config.write_text("[remote]\n", encoding="utf-8")
-            source_one = root / "Latin.7z.001"
-            source_two = root / "YouKnoWhat?.7z.001"
+            source_dir = root / "source"
+            source_dir.mkdir()
+            (source_dir / "nested").mkdir()
+            source_one = source_dir / "nested" / "Latin.7z.001"
+            source_two = source_dir / "nested" / "YouKnoWhat?.7z.001"
+            source_three = source_dir / "nested" / "colon:name\\part.bin"
             source_one.write_bytes(b"first")
             source_two.write_bytes(b"second")
+            source_three.write_bytes(b"third")
+            file_list = root / "files-from0.bin"
+            file_list.write_bytes(
+                b"nested/Latin.7z.001\0"
+                b"nested/YouKnoWhat?.7z.001\0"
+                b"nested/colon:name\\part.bin\0"
+            )
             fake = FileListRunner()
             with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
-                result = RcloneRunner(fake).verify_complete_files(
-                    [source_one, source_two], "remote:backup", config,
+                result = RcloneRunner(fake).verify_folder_files(
+                    source_dir, "remote:backup", config,
                     workspace_root=root, config_root=root,
-                    remote_names=["nested/Latin.7z.001", "nested/YouKnoWhat?.7z.001"],
+                    files_from0=file_list,
+                    expected_paths=[
+                        "nested/Latin.7z.001",
+                        "nested/YouKnoWhat?.7z.001",
+                        "nested/colon:name\\part.bin",
+                    ],
                 )
             self.assertTrue(result["complete"])
-            self.assertEqual(len(fake.commands), 2)
-            for (command, _), (list_path, contents), source, file_name in zip(
-                fake.commands,
-                fake.file_lists,
-                (source_one, source_two),
-                ("Latin.7z.001", "YouKnoWhat?.7z.001"),
-            ):
-                self.assertEqual(command[:4], ["rclone", "check", str(root), "remote:backup/nested"])
-                self.assertIn("--one-way", command)
-                self.assertIn("--download", command)
-                self.assertNotIn("--size-only", command)
-                self.assertEqual(contents, file_name + "\n")
-                self.assertFalse(list_path.exists())
+            self.assertEqual(len(fake.commands), 1)
+            command = fake.commands[0][0]
+            self.assertEqual(command[:4], ["rclone", "check", str(source_dir), "remote:backup"])
+            self.assertIn("--one-way", command)
+            self.assertIn("--size-only", command)
+            self.assertNotIn("--download", command)
+            self.assertEqual(fake.file_lists[0][1], file_list.read_bytes())
+            self.assertEqual(result["verified"], [
+                "nested/Latin.7z.001",
+                "nested/YouKnoWhat?.7z.001",
+                "nested/colon:name\\part.bin",
+            ])
 
     def test_probe_access_reads_config_and_remote_without_mutating_or_exposing_secrets(self):
         with tempfile.TemporaryDirectory() as temp_dir:

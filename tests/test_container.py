@@ -45,7 +45,18 @@ class ContainerBuildTests(unittest.TestCase):
             self.assertNotIn("TDL_DOWNLOAD_USER", env_example)
         self.assertIn("ARG TARGETARCH", basefile)
         self.assertIn("ARG BUILDPLATFORM=linux/amd64", basefile)
-        self.assertIn("rclone", basefile)
+        self.assertIn("ARG RCLONE_VERSION=1.76.0", basefile)
+        self.assertIn(
+            "ARG RCLONE_SHA256_AMD64=9db7ee9b725bce7cdd195b9183449a4c6fb93cad3e6578e70b87c0bc7f6062e9",
+            basefile,
+        )
+        self.assertIn(
+            "ARG RCLONE_SHA256_ARM64=c486d404ecbc4bb3d54052a0efaf9e652cf0d2c645e4523f7a2aefa112fe029c",
+            basefile,
+        )
+        self.assertIn("downloads.rclone.org/v${RCLONE_VERSION}/${deb_name}", basefile)
+        self.assertIn("sha256sum -c -", basefile)
+        self.assertNotIn("        rclone \\\n", basefile)
         self.assertIn("FROM --platform=${BUILDPLATFORM}", basefile)
         self.assertIn("RUN go mod download", basefile)
         self.assertIn("go build -mod=mod -p=1", basefile)

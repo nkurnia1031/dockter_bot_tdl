@@ -23,6 +23,9 @@ FROM ubuntu:22.04 AS base
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 ARG TDL_FALLBACK_VERSION=0.20.3
+ARG RCLONE_VERSION=1.76.0
+ARG RCLONE_SHA256_AMD64=9db7ee9b725bce7cdd195b9183449a4c6fb93cad3e6578e70b87c0bc7f6062e9
+ARG RCLONE_SHA256_ARM64=c486d404ecbc4bb3d54052a0efaf9e652cf0d2c645e4523f7a2aefa112fe029c
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -35,11 +38,24 @@ RUN apt-get update \
         python3 \
         python3-pip \
         ffmpeg \
-        rclone \
         tar \
         util-linux \
         p7zip-full \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) rclone_arch=amd64; expected="${RCLONE_SHA256_AMD64}" ;; \
+        arm64) rclone_arch=arm64; expected="${RCLONE_SHA256_ARM64}" ;; \
+        *) echo "Unsupported target architecture for rclone: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    deb_name="rclone-v${RCLONE_VERSION}-linux-${rclone_arch}.deb"; \
+    curl -fsSL "https://downloads.rclone.org/v${RCLONE_VERSION}/${deb_name}" -o /tmp/rclone.deb; \
+    test -n "${expected}"; \
+    printf '%s  %s\n' "${expected}" /tmp/rclone.deb | sha256sum -c -; \
+    dpkg -i /tmp/rclone.deb; \
+    rclone version; \
+    rm -f /tmp/rclone.deb
 
 USER root
 

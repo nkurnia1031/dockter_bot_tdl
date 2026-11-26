@@ -2163,14 +2163,14 @@ class ControlPlane:
                 for raw in raw_sources:
                     if not isinstance(raw, dict) or set(raw) != {"path", "is_dir"} or type(raw.get("is_dir")) is not bool:
                         raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan rclone tidak valid.", status_code=422)
-                    source_path = str(raw.get("path") or "").replace("\\", "/")
+                    source_path = str(raw.get("path") or "")
                     parts = source_path.split("/")
                     if (
                         not source_path
                         or source_path.startswith("/")
                         or len(source_path) > 2048
-                        or any(ord(char) < 32 for char in source_path)
-                        or any(not part or part in {".", ".."} or ":" in part for part in parts)
+                        or "\0" in source_path
+                        or any(not part or part in {".", ".."} for part in parts)
                     ):
                         raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
                     if source_path not in seen:
@@ -2461,12 +2461,12 @@ class ControlPlane:
             else:
                 if destination_id is not None or str(payload.get("folder") or "").strip():
                     raise DomainError("STORAGE_TARGET_INVALID", "Pilih tepat satu tujuan upload.", status_code=422)
-                raw_remote_path = str(payload.get("rclone_path") or "").replace("\\", "/")
+                raw_remote_path = str(payload.get("rclone_path") or "")
                 if raw_remote_path.startswith("/"):
                     raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
                 remote_path = raw_remote_path.strip("/")
                 parts = remote_path.split("/") if remote_path else []
-                if len(remote_path) > 2048 or any(ord(char) < 32 for char in remote_path) or any(not part or part in {".", ".."} or ":" in part for part in parts):
+                if len(remote_path) > 2048 or "\0" in remote_path or any(not part or part in {".", ".."} for part in parts):
                     raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
                 values["rclone_path"] = remote_path
                 values["rclone_destination"] = self._utility_settings_snapshot().get("rclone_destination", "googledrive:backup")
@@ -5547,7 +5547,7 @@ class ControlPlane:
                 "Verifikasi lengkap harus memastikan file ini tidak ada di tujuan sebelum Retry.",
                 status_code=409,
             )
-        raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+        raw_path = str(item.get("path") or "")
         path = PurePosixPath(raw_path)
         if (
             not raw_path
@@ -5608,7 +5608,7 @@ class ControlPlane:
                 continue
             if item.get("status") not in {"failed", "pending"} or item.get("retryable") is not True:
                 continue
-            raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+            raw_path = str(item.get("path") or "")
             path = PurePosixPath(raw_path)
             if (
                 not raw_path
@@ -6419,7 +6419,7 @@ class ControlPlane:
         for index, item in enumerate(source_items):
             if not isinstance(item, dict) or item.get("status") != "needs_reconciliation":
                 continue
-            raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+            raw_path = str(item.get("path") or "")
             path = PurePosixPath(raw_path)
             if (
                 not raw_path
@@ -6442,7 +6442,7 @@ class ControlPlane:
                 "profile": profile_name,
             }
             if provider == "rclone":
-                raw_target_path = str(item.get("target_path") or "").replace("\\", "/").strip()
+                raw_target_path = str(item.get("target_path") or "")
                 target_path = PurePosixPath(raw_target_path)
                 if (
                     not raw_target_path

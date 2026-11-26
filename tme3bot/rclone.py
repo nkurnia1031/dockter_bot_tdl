@@ -165,7 +165,7 @@ class RcloneRunner:
     def _remote_path(root: str, relative_path: str = "") -> tuple[str, str]:
         """Join a browser path below a configured root and reject traversal."""
         root = str(root or "").strip().rstrip("/")
-        relative = str(relative_path or "").replace("\\", "/")
+        relative = str(relative_path or "")
         if relative.startswith("/"):
             raise RcloneError(
                 "Path rclone harus berada di bawah root yang dikonfigurasi.",
@@ -177,8 +177,8 @@ class RcloneRunner:
             not root
             or relative.startswith("/")
             or len(relative) > 2048
-            or any(ord(char) < 32 for char in relative)
-            or any(not part or part in {".", ".."} or ":" in part for part in parts)
+            or "\0" in relative
+            or any(not part or part in {".", ".."} for part in parts)
         ):
             raise RcloneError(
                 "Path rclone harus berada di bawah root yang dikonfigurasi.",
@@ -238,8 +238,8 @@ class RcloneRunner:
         for raw in raw_entries:
             if not isinstance(raw, dict):
                 continue
-            name = str(raw.get("Name") or "").strip()
-            if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            name = str(raw.get("Name") or "")
+            if not name or name in {".", ".."} or "/" in name:
                 continue
             is_dir = raw.get("IsDir") is True
             try:
@@ -325,10 +325,10 @@ class RcloneRunner:
         for raw in raw_entries:
             if not isinstance(raw, dict):
                 continue
-            raw_path = str(raw.get("Path") or raw.get("Name") or "").replace("\\", "/")
+            raw_path = str(raw.get("Path") or raw.get("Name") or "")
             parts = raw_path.split("/")
             if not raw_path or raw_path.startswith("/") or any(
-                not part or part in {".", ".."} or ":" in part for part in parts
+                not part or part in {".", ".."} for part in parts
             ):
                 continue
             top = parts[0]
@@ -370,8 +370,9 @@ class RcloneRunner:
         file_name: str,
         file_size: int | None,
         log_callback: Callable[[str], None] | None,
+        object_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> Callable[[str], None] | None:
-        if callback is None and log_callback is None:
+        if callback is None and log_callback is None and object_callback is None:
             return None
 
         def on_line(line: str) -> None:
@@ -413,6 +414,22 @@ class RcloneRunner:
                         percent_value = min(100.0, max(0.0, float(percent))) if percent is not None else None
                     except (TypeError, ValueError):
                         percent_value = None
+                    try:
+                        batch_bytes = max(0, int(stats.get("bytes") or 0))
+                    except (TypeError, ValueError):
+                        batch_bytes = None
+                    try:
+                        batch_speed = max(0, int(float(stats.get("speed") or 0)))
+                    except (TypeError, ValueError):
+                        batch_speed = None
+                    try:
+                        batch_eta = max(0, int(float(stats.get("eta")))) if stats.get("eta") is not None else None
+                    except (TypeError, ValueError):
+                        batch_eta = None
+                    try:
+                        completed_transfers = max(0, int(stats.get("transfers") or 0))
+                    except (TypeError, ValueError):
+                        completed_transfers = None
                 try:
                     if callback is not None:
                         callback({
@@ -422,6 +439,10 @@ class RcloneRunner:
                             "speed_bps": speed_value,
                             "eta_seconds": eta_value,
                             "percent": percent_value,
+                            "batch_bytes_current": batch_bytes,
+                            "batch_speed_bps": batch_speed,
+                            "batch_eta_seconds": batch_eta,
+                            "batch_transfers_complete": completed_transfers,
                         })
                 except Exception:
                     # Telemetry must never change the outcome of a transfer.
@@ -429,6 +450,12 @@ class RcloneRunner:
                 # Never copy raw rclone progress output into the worker log or
                 # job event; only the normalized fields above are user-facing.
                 return
+            if isinstance(payload, dict) and object_callback is not None:
+                try:
+                    object_callback(payload)
+                except Exception:
+                    # Transfer accounting must never change the outcome of a transfer.
+                    pass
             if log_callback is not None:
                 log_callback(line)
 
@@ -444,14 +471,12 @@ class RcloneRunner:
 
     @staticmethod
     def _remote_entry_name(value: str) -> str:
-        name = str(value or "").strip()
+        name = str(value or "")
         if (
             not name
             or len(name) > 120
             or name in {".", ".."}
             or "/" in name
-            or "\\" in name
-            or ":" in name
             or any(ord(char) < 32 for char in name)
         ):
             raise RcloneError(
@@ -636,12 +661,12 @@ class RcloneRunner:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            relative = str(entry.get("Path") or entry.get("Name") or "").replace("\\", "/")
+            relative = str(entry.get("Path") or entry.get("Name") or "")
             parts = relative.split("/")
             if (
                 not relative
                 or relative.startswith("/")
-                or any(not part or part in {".", ".."} or ":" in part for part in parts)
+                or any(not part or part in {".", ".."} for part in parts)
                 or any(ord(char) < 32 for char in relative)
             ):
                 raise RcloneError(
@@ -1027,7 +1052,7 @@ class RcloneRunner:
                 ]
                 selected_paths: list[tuple[str, bool, str]] = []
                 for selected in selected_scopes:
-                    selected_path = str(selected.get("path") or "").replace("\\", "/").strip("/")
+                    selected_path = str(selected.get("path") or "").strip("/")
                     selected_is_dir = selected.get("is_dir") is True
                     if not selected_path or selected_path.rpartition("/")[0] != parent_relative:
                         continue
@@ -1502,10 +1527,10 @@ class RcloneRunner:
             for entry in entries:
                 if not isinstance(entry, dict) or entry.get("IsDir") is True:
                     continue
-                relative = str(entry.get("Path") or entry.get("Name") or "").replace("\\", "/")
+                relative = str(entry.get("Path") or entry.get("Name") or "")
                 parts = relative.split("/")
                 if not relative or relative.startswith("/") or any(
-                    not part or part in {".", ".."} or ":" in part for part in parts
+                    not part or part in {".", ".."} for part in parts
                 ):
                     raise RcloneError("Pilihan folder rclone berisi path file yang tidak valid.")
                 child_remote, _ = self._remote_path(
@@ -1615,48 +1640,191 @@ class RcloneRunner:
             for item in entries
         )
 
-    def verify_complete_files(
+    def copy_folder(
         self,
-        files: Iterable[Path],
+        source: Path,
         destination: str,
         config_path: Path,
         *,
         workspace_root: Path,
         config_root: Path,
-        remote_names: Iterable[str],
-    ) -> dict[str, object]:
-        """Verify complete content via a read-only, exact-file rclone check."""
-        paths = [Path(item).resolve() for item in files]
-        names = list(remote_names)
-        if len(paths) != len(names):
-            raise RcloneError("Jumlah path verifikasi rclone tidak sesuai.")
-        workspace = Path(workspace_root).resolve()
-        config = Path(config_path).resolve()
+        files_from0: Path,
+        expected_paths: Iterable[str],
+        completed_paths: set[str] | None = None,
+    ) -> set[str]:
+        """Copy one workspace folder in one cancellable rclone process."""
+        destination = str(destination or "").strip()
         try:
-            config.relative_to(Path(config_root).resolve())
+            validate_rclone_destination(destination)
         except ValueError as exc:
-            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
-        verified: list[str] = []
-        for path, name in zip(paths, names):
+            raise RcloneError(str(exc)) from exc
+        workspace = Path(workspace_root).resolve()
+        source_path = Path(source).resolve()
+        try:
+            source_path.relative_to(workspace)
+        except ValueError as exc:
+            raise RcloneError("Folder sumber rclone harus berada di dalam workspace.") from exc
+        if not source_path.is_dir():
+            raise RcloneError("Folder sumber rclone tidak ditemukan.", code="RCLONE_SOURCE_INVALID")
+        config = self._storage_config(config_path, config_root)
+        file_list = Path(files_from0).resolve()
+        if not file_list.is_file():
+            raise RcloneError("Daftar file rclone tidak tersedia.", code="RCLONE_SOURCE_INVALID")
+        expected = {str(item) for item in expected_paths if str(item)}
+        if any(
+            item.startswith("/")
+            or "\0" in item
+            or any(not part or part in {".", ".."} for part in item.split("/"))
+            for item in expected
+        ):
+            raise RcloneError("Daftar file rclone berisi path yang tidak aman.", code="RCLONE_SOURCE_INVALID")
+        transferred = completed_paths if completed_paths is not None else set()
+
+        def record_transfer(payload: dict[str, object]) -> None:
+            if str(payload.get("level") or "").casefold() != "info":
+                return
+            message = str(payload.get("msg") or "")
+            if not message.startswith("Copied (new)"):
+                return
+            object_path = payload.get("object")
+            if isinstance(object_path, str) and object_path in expected:
+                transferred.add(object_path)
+
+        command = [
+            "rclone", "copy", str(source_path), destination,
+            "-P", "--ignore-existing", "--fast-list",
+            "--files-from0", str(file_list), "--config", str(config),
+            "--log-level", "INFO", "--stats", "1s",
+            "--stats-log-level", "NOTICE", "--use-json-log",
+        ]
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix="rclone-storage-upload",
+                output_callback=self._transfer_log_callback(
+                    self.transfer_callback,
+                    file_name="",
+                    file_size=None,
+                    log_callback=self.log_callback,
+                    object_callback=record_transfer,
+                ),
+                output_filter=self._keep_non_stats_output_line,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except TDLStalledError:
+            raise
+        except TDLCommandError as exc:
+            raise RcloneError(
+                f"rclone gagal mengirim folder (exit code {exc.returncode}).",
+                code=self._access_error_code(exc) or "RCLONE_UPLOAD_FAILED",
+            ) from exc
+        except OSError as exc:
+            raise RcloneError(
+                "Worker tidak dapat memulai proses rclone.",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            ) from exc
+        if result.returncode != 0:
+            raise RcloneError(
+                f"rclone gagal mengirim folder (exit code {result.returncode}).",
+                code=self._access_error_code(result) or "RCLONE_UPLOAD_FAILED",
+            )
+        return transferred
+
+    def verify_folder_files(
+        self,
+        source: Path,
+        destination: str,
+        config_path: Path,
+        *,
+        workspace_root: Path,
+        config_root: Path,
+        files_from0: Path,
+        expected_paths: Iterable[str],
+    ) -> dict[str, object]:
+        """Verify one upload batch by relative path and size, without content reads."""
+        destination = str(destination or "").strip()
+        try:
+            validate_rclone_destination(destination)
+            source_path = Path(source).resolve()
+            source_path.relative_to(Path(workspace_root).resolve())
+            remote, _ = self._remote_path(destination)
+        except (ValueError, RcloneError) as exc:
+            raise RcloneError("Root verifikasi rclone tidak valid.", code="RCLONE_VERIFY_UNAVAILABLE") from exc
+        if not source_path.is_dir():
+            raise RcloneError("Folder sumber verifikasi tidak tersedia.", code="RCLONE_VERIFY_UNAVAILABLE")
+        config = self._storage_config(config_path, config_root)
+        file_list = Path(files_from0).resolve()
+        if not file_list.is_file():
+            raise RcloneError("Daftar file verifikasi tidak tersedia.", code="RCLONE_VERIFY_UNAVAILABLE")
+        expected = {str(item) for item in expected_paths if str(item)}
+        if any("\n" in item or "\r" in item for item in expected):
+            return {
+                "complete": False, "verified": [], "missing": [], "different": [],
+                "errors": sorted(expected), "reason_code": "RCLONE_VERIFY_UNAVAILABLE",
+            }
+        with tempfile.TemporaryDirectory(prefix="tme3bot-rclone-check-") as temp_dir:
+            combined = Path(temp_dir) / "combined.txt"
+            command = [
+                "rclone", "check", str(source_path), remote, "--one-way",
+                "--size-only", "--fast-list", "--files-from0", str(file_list),
+                "--combined", str(combined), "--config", str(config),
+                "--log-level", "ERROR",
+            ]
             try:
-                path.relative_to(workspace)
-            except ValueError as exc:
-                raise RcloneError("File verifikasi harus berada di dalam workspace.") from exc
-            target, normalized = self._remote_path(destination, str(name))
-            try:
-                result = self._check_single_file(
-                    path,
-                    target,
-                    config,
-                    log_prefix="rclone-storage-full-verify",
-                    download=True,
+                result = self.runner.run(
+                    command,
+                    log_prefix="rclone-storage-upload-verify",
+                    output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
                 )
-            except (RcloneError, TDLStalledError, TDLCommandError, OSError) as exc:
-                return {"complete": False, "verified": verified, "reason_code": "RCLONE_VERIFY_UNAVAILABLE"}
-            if result.returncode != 0:
-                return {"complete": False, "verified": verified, "reason_code": "RCLONE_CONTENT_MISMATCH"}
-            verified.append(normalized)
-        return {"complete": len(verified) == len(paths), "verified": verified, "reason_code": ""}
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                raise RcloneError(
+                    "Verifikasi batch rclone tidak dapat dijalankan.",
+                    code="RCLONE_VERIFY_UNAVAILABLE",
+                ) from exc
+            if result.returncode not in {0, 1}:
+                raise RcloneError(
+                    "Verifikasi batch rclone gagal.",
+                    code=self._access_error_code(result) or "RCLONE_VERIFY_UNAVAILABLE",
+                )
+            try:
+                lines = combined.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+            except OSError as exc:
+                raise RcloneError(
+                    "Laporan verifikasi batch rclone tidak tersedia.",
+                    code="RCLONE_VERIFY_UNAVAILABLE",
+                ) from exc
+        states: dict[str, str] = {}
+        for line in lines:
+            if len(line) < 3 or line[1] != " " or line[0] not in "=+*!-":
+                continue
+            relative = line[2:]
+            if relative:
+                states[relative] = line[0]
+        if any(path not in states for path in expected):
+            return {
+                "complete": False,
+                "verified": sorted(path for path in expected if states.get(path) == "="),
+                "missing": sorted(path for path in expected if states.get(path) == "+"),
+                "different": sorted(path for path in expected if states.get(path) == "*"),
+                "errors": sorted(path for path in expected if states.get(path) == "!"),
+                "reason_code": "RCLONE_VERIFY_INCOMPLETE",
+            }
+        verified = sorted(path for path in expected if states.get(path) == "=")
+        missing = sorted(path for path in expected if states.get(path) == "+")
+        different = sorted(path for path in expected if states.get(path) == "*")
+        errors = sorted(path for path in expected if states.get(path) == "!")
+        complete = len(verified) == len(expected)
+        return {
+            "complete": complete,
+            "verified": verified,
+            "missing": missing,
+            "different": different,
+            "errors": errors,
+            "reason_code": "" if complete else "RCLONE_SIZE_MISMATCH",
+        }
 
     def _check_single_file(
         self,
@@ -1665,9 +1833,8 @@ class RcloneRunner:
         config: Path,
         *,
         log_prefix: str,
-        download: bool,
     ):
-        """Run `rclone check` with directory roots and an exact raw file list.
+        """Compare an exact file's name and size without reading file contents.
 
         `rclone check` treats its two operands as filesystem roots. Passing a
         single Google Drive object as the destination root fails with
@@ -1704,7 +1871,7 @@ class RcloneRunner:
                 "--one-way",
                 "--files-from-raw",
                 str(files_from),
-                "--download" if download else "--size-only",
+                "--size-only",
                 "--config",
                 str(config),
                 "--log-level",
@@ -1992,7 +2159,7 @@ class RcloneRunner:
             has_name = False
             for entry in entries:
                 candidate = str(entry.get("Path") or entry.get("Name") or "")
-                candidate = candidate.replace("\\", "/").strip("/")
+                candidate = candidate.strip("/")
                 if candidate != normalized_name:
                     continue
                 has_name = True
@@ -2004,7 +2171,7 @@ class RcloneRunner:
             return False, has_name
 
         for path, raw_name in zip(paths, names):
-            remote_name = str(raw_name).replace("\\", "/").strip("/")
+            remote_name = str(raw_name).strip("/")
             remote_parts = [part for part in remote_name.split("/") if part]
             if not remote_parts or any(part in {".", ".."} for part in remote_parts):
                 raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.")
@@ -2015,7 +2182,6 @@ class RcloneRunner:
                     target,
                     config,
                     log_prefix="rclone-verify",
-                    download=False,
                 )
             except (RcloneError, TDLStalledError, TDLCommandError, OSError) as exc:
                 errors.append({"name": remote_name, "error": str(exc)[:300]})
