@@ -39,6 +39,56 @@ describe('TTS page target controls', () => {
     expect(await screen.findByText(/Hasil scan terakhir \(informasi\): archive: siap/)).toBeTruthy();
   });
 
+  it('requires an explicit worker in Lite and submits the selected worker', async () => {
+    const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const path = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ path, method, body });
+      if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({
+        worker_selection_required: true,
+        items: [{ name: 'utama', enabled: true, ready: true, reason_code: 'ready', queued_jobs: 0 }],
+      }), { status: 200 });
+      if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
+      if (path.endsWith('/tts/jobs') && method === 'POST') return new Response(JSON.stringify({ id: 'tts-job-utama', status: 'queued' }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(TtsPage);
+    const workerPicker = await screen.findByLabelText('Worker untuk job ini');
+    expect(screen.queryByRole('option', { name: 'Otomatis — antrean terpendek' })).toBeNull();
+    expect(screen.getByRole('option', { name: 'Pilih worker untuk job ini' })).toBeTruthy();
+    await fireEvent.input(await screen.findByLabelText('Judul audio'), { target: { value: 'Bab 1' } });
+    await fireEvent.input(screen.getByLabelText(/Teks/), { target: { value: 'Teks untuk dibacakan' } });
+    const submit = screen.getByRole('button', { name: 'Buat job TTS' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+
+    await fireEvent.change(workerPicker, { target: { value: 'utama' } });
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+
+    expect(await screen.findByText('Job TTS masuk antrean.')).toBeTruthy();
+    expect(requests.find((request) => request.path.endsWith('/tts/jobs') && request.method === 'POST')?.body)
+      .toMatchObject({ title: 'Bab 1', text: 'Teks untuk dibacakan', worker: 'utama' });
+  });
+
+  it('keeps automatic worker selection available outside Lite', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const path = String(input);
+      if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({
+        worker_selection_required: false,
+        items: [{ name: 'local', enabled: true, ready: true, reason_code: 'ready', queued_jobs: 0 }],
+      }), { status: 200 });
+      if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(TtsPage);
+    await screen.findByLabelText('Worker untuk job ini');
+    expect(screen.getByRole('option', { name: 'Otomatis — antrean terpendek' })).toBeTruthy();
+  });
+
   it('uses Profile scan readiness without a per-page TDL access verification action', async () => {
     const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {

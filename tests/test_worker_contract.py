@@ -1,7 +1,7 @@
 import io
 import urllib.error
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from fastapi.testclient import TestClient
 
@@ -67,6 +67,24 @@ class CapturingPublisher:
 
 
 class WorkerContractTests(unittest.TestCase):
+    @patch("tme3bot.infrastructure.http_client.build_opener")
+    def test_fast_worker_health_probe_uses_cloudflare_accepted_user_agent(self, build_opener):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok": true, "role": "worker"}'
+        opener = Mock()
+        opener.open.return_value = response
+        build_opener.return_value = opener
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        result = dispatcher.check_worker_fast("remote")
+
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://worker.test/healthz")
+        self.assertEqual(request.get_header("User-agent"), "tme3bot-worker-health/1.0")
+        self.assertTrue(result["healthy"])
+
     @patch("tme3bot.infrastructure.http_client.request_json")
     def test_progress_snapshot_dispatch_is_one_authenticated_worker_request(self, request):
         response = {"items": [{"job_id": "job-1", "progress": {"phase": "extracting"}}]}

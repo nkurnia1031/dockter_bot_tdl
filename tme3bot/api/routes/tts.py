@@ -28,7 +28,12 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
     def list_tts_workers(actor=Depends(current_actor)):
         del actor
         items = context.control_plane.tts_worker_statuses(destination=_tts_chat_ref(context))
-        return {"items": items}
+        return {
+            "items": items,
+            "worker_selection_required": str(
+                getattr(context.config, "gateway_mode", "full") or "full"
+            ).strip().lower() == "lite",
+        }
 
     @app.get("/api/v1/diagnostics/tts/logs")
     def tts_diagnostic_logs(limit: int = Query(100, ge=1, le=500), actor=Depends(current_actor)):

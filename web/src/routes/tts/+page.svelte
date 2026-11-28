@@ -20,6 +20,7 @@
   let title = $state('');
   let text = $state('');
   let workers = $state<TtsWorker[]>([]);
+  let workerSelectionRequired = $state(false);
   let workersRefreshing = $state(false);
   let worker = $state('');
   let workersLoading = $state(true);
@@ -56,8 +57,12 @@
   async function loadWorkers() {
     workersLoading = true;
     try {
-      const result = await api<{ items: TtsWorker[] }>('/tts/workers');
+      const result = await api<{
+        items: TtsWorker[];
+        worker_selection_required?: boolean;
+      }>('/tts/workers');
       workers = result.items || [];
+      workerSelectionRequired = result.worker_selection_required === true;
       if (worker && !workers.some((item) => item.name === worker && item.enabled)) worker = '';
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Daftar worker TTS gagal dimuat.';
@@ -117,6 +122,10 @@
       error = 'Judul dan teks wajib diisi.';
       return;
     }
+    if (workerSelectionRequired && !worker) {
+      error = 'Pilih worker untuk job TTS di Gateway Lite.';
+      return;
+    }
     submitting = true;
     try {
       const payload: { title: string; text: string; worker?: string } = {
@@ -152,7 +161,7 @@
   <div>
     <p class="eyebrow">TEXT TO SPEECH</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">TTS Novel</h1>
-    <p class="muted mt-2 max-w-2xl">Ubah teks menjadi audio. Pilih worker TTS tertentu atau biarkan sistem memilih antrean terpendek.</p>
+    <p class="muted mt-2 max-w-2xl">Ubah teks menjadi audio. {workerSelectionRequired ? 'Pilih worker TTS aktif untuk job ini.' : 'Pilih worker TTS tertentu atau biarkan sistem memilih antrean terpendek.'}</p>
   </div>
   <div class="grid size-12 place-items-center rounded-2xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Volume2 size={23}/></div>
 </header>
@@ -213,7 +222,7 @@
     {#if activeWorkers.length > 0 && !workersLoading}
       <label class="grid gap-1.5 text-sm font-semibold">Worker untuk job ini
         <select class="field" bind:value={worker}>
-          <option value="">Otomatis — antrean terpendek</option>
+          <option value="">{workerSelectionRequired ? 'Pilih worker untuk job ini' : 'Otomatis — antrean terpendek'}</option>
           {#each activeWorkers as option}<option value={option.name}>{option.name} · {option.queued_jobs} job dalam antrean</option>{/each}
         </select>
       </label>
@@ -231,7 +240,7 @@
     {#if notice}<p role="status" class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">{notice}</p>{/if}
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p class="muted text-xs">Pause berlaku setelah batch aktif selesai. Resume melanjutkan dari checkpoint.</p>
-      <button class="button primary" type="submit" disabled={submitting || workersLoading || activeWorkers.length === 0 || !title.trim() || !text.trim() || text.length > maxChars}>
+      <button class="button primary" type="submit" disabled={submitting || workersLoading || activeWorkers.length === 0 || (workerSelectionRequired && !worker) || !title.trim() || !text.trim() || text.length > maxChars}>
         <Volume2 size={16}/>{submitting ? 'Mengirim...' : 'Buat job TTS'}
       </button>
     </div>

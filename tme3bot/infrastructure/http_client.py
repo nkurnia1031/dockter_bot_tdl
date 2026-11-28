@@ -286,7 +286,13 @@ class WorkerHttpDispatcher:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
         request = Request(
             str(record["url"]).rstrip("/") + "/healthz",
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                # Cloudflare rejects urllib's default Python-urllib user agent
+                # on this public health route, making a healthy worker look
+                # offline to the gateway.
+                "User-Agent": "tme3bot-worker-health/1.0",
+            },
             method="GET",
         )
         try:

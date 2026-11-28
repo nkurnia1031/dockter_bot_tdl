@@ -904,6 +904,7 @@ class BackendApiTests(unittest.TestCase):
         tts_workers = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(tts_workers.status_code, 200, tts_workers.text)
         self.assertEqual([item["name"] for item in tts_workers.json()["items"]], ["remote-1"])
+        self.assertTrue(tts_workers.json()["worker_selection_required"])
 
     def test_lite_exposes_and_accepts_external_worker_named_local(self):
         headers = self.login(42)
@@ -7244,6 +7245,7 @@ class BackendApiTests(unittest.TestCase):
 
         options = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(options.status_code, 200, options.text)
+        self.assertFalse(options.json()["worker_selection_required"])
         self.assertEqual(
             {item["name"] for item in options.json()["items"]},
             {"local", "remote-tts"},
